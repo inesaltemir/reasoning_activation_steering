@@ -1,0 +1,45 @@
+{"problem_id": "FACT_01", "problem": "What is the capital of France?", "expected_answer": "Paris"}
+{"problem_id": "FACT_02", "problem": "Who wrote the play Romeo and Juliet?", "expected_answer": "William Shakespeare"}
+{"problem_id": "FACT_03", "problem": "What is the chemical symbol for the element oxygen?", "expected_answer": "O"}
+{"problem_id": "FACT_04", "problem": "In what year did the Titanic sink?", "expected_answer": "1912"}
+{"problem_id": "FACT_05", "problem": "Which planet is known as the Red Planet?", "expected_answer": "Mars"}
+{"problem_id": "FACT_06", "problem": "What is the largest ocean on Earth?", "expected_answer": "Pacific Ocean"}
+{"problem_id": "FACT_07", "problem": "Who painted the Mona Lisa?", "expected_answer": "Leonardo da Vinci"}
+{"problem_id": "FACT_08", "problem": "What is the freezing point of water in Celsius?", "expected_answer": "0"}
+{"problem_id": "FACT_09", "problem": "Which continent is the Sahara Desert located on?", "expected_answer": "Africa"}
+{"problem_id": "FACT_10", "problem": "What is the currency of Japan?", "expected_answer": "Yen"}
+{"problem_id": "TRANS_01", "problem": "Translate the English word 'apple' into Spanish.", "expected_answer": "manzana"}
+{"problem_id": "TRANS_02", "problem": "What is the French translation for the phrase 'Thank you'?", "expected_answer": "Merci"}
+{"problem_id": "TRANS_03", "problem": "Translate the word 'dog' into German.", "expected_answer": "Hund"}
+{"problem_id": "TRANS_04", "problem": "How do you say 'goodbye' in Italian?", "expected_answer": "Arrivederci"}
+{"problem_id": "TRANS_05", "problem": "Translate the English word 'water' into Portuguese.", "expected_answer": "agua"}
+{"problem_id": "CHAT_01", "problem": "Hello, how are you doing today?", "expected_answer": "I am doing well, thank you! How can I help you?"}
+{"problem_id": "CHAT_02", "problem": "Good morning!", "expected_answer": "Good morning! How can I assist you today?"}
+{"problem_id": "CHAT_03", "problem": "What is your name?", "expected_answer": "I am an AI assistant."}
+{"problem_id": "CHAT_04", "problem": "Nice to meet you.", "expected_answer": "Nice to meet you too! How can I help you today?"}
+{"problem_id": "CHAT_05", "problem": "Thank you for your help!", "expected_answer": "You are welcome! Let me know if you need anything else."}
+{"problem_id": "EXTR_01", "problem": "Extract the names from this text: 'Alice went to the store with Bob.'", "expected_answer": "Alice, Bob"}
+{"problem_id": "EXTR_02", "problem": "Convert this string to uppercase: 'hello world'", "expected_answer": "HELLO WORLD"}
+{"problem_id": "EXTR_03", "problem": "Reverse this list of numbers: 1, 2, 3", "expected_answer": "3, 2, 1"}
+{"problem_id": "EXTR_04", "problem": "What is the first word of this sentence?", "expected_answer": "What"}
+{"problem_id": "EXTR_05", "problem": "Count the number of vowels in the word 'cat'.", "expected_answer": "1"}
+{"problem_id": "MATH_01", "problem": "If 3x + 7 = 22, solve for x step-by-step.", "expected_answer": "5"}
+{"problem_id": "MATH_02", "problem": "A train travels 120 miles in 2 hours. What is its average speed in miles per hour?", "expected_answer": "60"}
+{"problem_id": "MATH_03", "problem": "What is the area of a right triangle with a base of 6 and a height of 8?", "expected_answer": "24"}
+{"problem_id": "MATH_04", "problem": "If a jacket costs $80 and is on sale for 25% off, what is the final price?", "expected_answer": "60"}
+{"problem_id": "MATH_05", "problem": "Solve the system of equations: y = 2x and x + y = 12. What is x?", "expected_answer": "4"}
+{"problem_id": "LOGIC_01", "problem": "All flurbs are snarks. Some snarks are blips. Are all flurbs definitely blips? Explain your reasoning.", "expected_answer": "No"}
+{"problem_id": "LOGIC_02", "problem": "Alice is taller than Bob. Bob is taller than Charlie. Who is the shortest?", "expected_answer": "Charlie"}
+{"problem_id": "LOGIC_03", "problem": "If it rains, the grass is wet. The grass is not wet. Did it rain?", "expected_answer": "No"}
+{"problem_id": "LOGIC_04", "problem": "In a foot race, you overtake the person in second place. What place are you in now?", "expected_answer": "Second"}
+{"problem_id": "LOGIC_05", "problem": "A bat and a ball cost $1.10 in total. The bat costs $1.00 more than the ball. How much does the ball cost in cents?", "expected_answer": "5"}
+{"problem_id": "ALG_01", "problem": "Consider the Python code: x = 5; x = x * 2; x = x - 3. What is the final value of x?", "expected_answer": "7"}
+{"problem_id": "ALG_02", "problem": "I start with an empty stack. I push 1, push 2, pop, push 3. What is at the top of the stack?", "expected_answer": "3"}
+{"problem_id": "ALG_03", "problem": "Array A is [4, 1, 3]. If I sort it in ascending order, what is the value at index 1 (zero-indexed)?", "expected_answer": "3"}
+{"problem_id": "ALG_04", "problem": "Loop i from 1 to 3 inclusive. Inside, add i to total. Total starts at 0. What is total at the end?", "expected_answer": "6"}
+{"problem_id": "ALG_05", "problem": "String S is 'ab'. I concatenate S to itself 3 times. What is the length of the new string?", "expected_answer": "8"}
+{"problem_id": "PUZZLE_01", "problem": "I am an odd number. Take away a letter and I become even. What number am I?", "expected_answer": "Seven"}
+{"problem_id": "PUZZLE_02", "problem": "Mary's father has four children: Spring, Summer, Autumn, and what is the name of the fourth?", "expected_answer": "Mary"}
+{"problem_id": "PUZZLE_03", "problem": "A farmer has 17 sheep and all but nine die. How many are left?", "expected_answer": "9"}
+{"problem_id": "PUZZLE_04", "problem": "If you have a 3-liter jug and a 5-liter jug, how many liters do you get if you fill the 5, pour into the 3 until full, and keep what is left in the 5?", "expected_answer": "2"}
+{"problem_id": "PUZZLE_05", "problem": "What is the next number in the sequence: 2, 4, 8, 16, ...?", "expected_answer": "32"}

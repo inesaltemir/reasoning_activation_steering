@@ -1,0 +1,15 @@
+{"problem_id": "FACT_01", "problem": "What is the capital of France?", "expected_answer": "Paris"}
+{"problem_id": "FACT_02", "problem": "Who wrote the play Romeo and Juliet?", "expected_answer": "William Shakespeare"}
+{"problem_id": "FACT_03", "problem": "What is the chemical symbol for the element oxygen?", "expected_answer": "O"}
+{"problem_id": "FACT_04", "problem": "In what year did the Titanic sink?", "expected_answer": "1912"}
+{"problem_id": "FACT_05", "problem": "Which planet is known as the Red Planet?", "expected_answer": "Mars"}
+{"problem_id": "TRANS_01", "problem": "Translate the English word 'apple' into Spanish.", "expected_answer": "manzana"}
+{"problem_id": "TRANS_02", "problem": "What is the French translation for the phrase 'Thank you'?", "expected_answer": "Merci"}
+{"problem_id": "TRANS_03", "problem": "Translate the word 'dog' into German.", "expected_answer": "Hund"}
+{"problem_id": "TRANS_04", "problem": "How do you say 'goodbye' in Italian?", "expected_answer": "Arrivederci"}
+{"problem_id": "TRANS_05", "problem": "Translate the English word 'water' into Portuguese.", "expected_answer": "agua"}
+{"problem_id": "CHAT_01", "problem": "Hello, how are you doing today?", "expected_answer": "I am doing well, thank you! How can I help you?"}
+{"problem_id": "CHAT_02", "problem": "Good morning!", "expected_answer": "Good morning! How can I assist you today?"}
+{"problem_id": "CHAT_03", "problem": "What is your name?", "expected_answer": "I am an AI assistant."}
+{"problem_id": "CHAT_04", "problem": "Nice to meet you.", "expected_answer": "Nice to meet you too! How can I help you today?"}
+{"problem_id": "CHAT_05", "problem": "Thank you for your help!", "expected_answer": "You are welcome! Let me know if you need anything else."}
