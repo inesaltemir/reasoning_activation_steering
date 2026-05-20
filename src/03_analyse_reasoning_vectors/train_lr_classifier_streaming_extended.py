@@ -1,21 +1,38 @@
 """
-Logistic Regression Classifier on Raw Activations  (Memory-Efficient)
-======================================================================
+Logistic regression classifier on raw activations (residual stream)
 
-Streams through disk-backed activation shards so that at most ONE shard
-(~100k rows × 4096 × float32 ≈ 1.6 GB) is in RAM at a time.
+Streams through activation shards so that at most ONE shard (≈ 1.6 GB) is in RAM at a time.
 
 Three granularity levels:
   Token-level  → SGDClassifier(log_loss) with partial_fit, shard by shard
   Step-level   → streaming aggregation into (num_steps, d_model), then LR
   Sample-level → streaming aggregation into (num_samples, d_model), then LR
 
-Usage:
-  python train_lr_classifier_streaming.py \
-    --raw_dir reasoning_vectors/Qwen3-8B/processbench/raw_activations \
-    --vectors_file reasoning_vectors/Qwen3-8B/processbench/reasoning_vectors_Qwen3-8B_processbench_with_steps_avg_storage.pt \
-    --target_layers 18 19 20 21 22 23 24 25 26 27 28 \
-    --output_dir results/lr_classifier
+Qwen3-8B hidden dimension:   "hidden_size": 4096
+
+Important parameters to justify / sweep over:
+
+1. Regularization strength (--C)
+    the current value is: 1.0
+    should perform a sweep, with a logarithmic grid ([0.001, 0.01, 0.1, 1.0, 10.0])
+    C is the inverse of the L2 regularization strength. 
+    if C is not small (tough) enough, prone to overfitting, as easy to find separating hyperplane for your data points in a high-dim space
+    for step and sample level data points, need stronger regularisation (smaller C), as have much less # data points
+    if C is too large, risk of overfitting
+
+    do separate sweep for token-level, step-level and sample-level
+
+2. Training duration for SGD (--sgd_epochs)
+    the current value is: 5
+    should perform a sweep and monitor convergence
+    the token-level model uses SGDClassifier with partial_fit. 
+    monitor learning rate decay and validation AUROC to see whether model acc converges
+
+3. Test/train split (--test_shards)
+    the current value for the split is 4/19, so 17% of data points for the test set
+    pretty common
+n_folds == 5, standard value for cross-validation 
+
 """
 
 import os
@@ -78,6 +95,9 @@ def run_token_level(raw_dir, hook_name, num_shards, args):
     """
     Stream through shards.  Last `test_shards` shards are held out.
     Train via SGDClassifier.partial_fit over `sgd_epochs` passes.
+    SGD updates weights incrementally and is notoriously sensitive to the number of passes over the data.
+    can do sweep over sgd_epochs value for [1, 5, 10, 20] while monitoring the validation AUROC
+    to seen when model has actually converged.
     """
     rng = np.random.RandomState(args.seed)
 
@@ -113,11 +133,13 @@ def run_token_level(raw_dir, hook_name, num_shards, args):
     print(f"    Balanced weights: {class_weight_map}")
 
     # --- Pass 2..N+1: partial_fit SGD ---
-    alpha = 1.0 / (args.C * 100_000)   # SGD alpha ≈ 1/(C*n) heuristic
+    # Alpha is defined as such to make the regularization strength of SGDClassifier match the regularization strength of LogisticRegression.
+    # SGD alpha ≈ 1/(C*n) heuristic
+    alpha = 1.0 / (args.C * n_total)  # Had harcoded 100_000, best to use total number of tokens n_total
     clf = SGDClassifier(
         loss="log_loss",
-        alpha=alpha,
-        max_iter=1,           # we control epochs ourselves
+        alpha=alpha,            # Constant that multiplies the regularization term. The higher the value, the stronger the regularization. 
+        max_iter=1,           # we control epochs ourselves later on with args.sgd_epochs
         warm_start=True,
         random_state=args.seed,
     )
@@ -160,7 +182,6 @@ def run_token_level(raw_dir, hook_name, num_shards, args):
         all_y_true.append(y_test)
         all_y_pred.append(clf.predict(X_test))
         all_y_prob.append(clf.decision_function(X_test))
-        # [NEW] Preserve lightweight test metadata for per-sample/per-step error analysis
         all_test_meta.extend(
             {"sample_idx": meta[i]["sample_idx"],
              "step_idx":   meta[i].get("step_idx", -1),
@@ -183,14 +204,12 @@ def run_token_level(raw_dir, hook_name, num_shards, args):
         "n_train_shards": len(train_shard_ids),
         "n_test_shards":  n_test,
         "sgd_epochs": args.sgd_epochs,
-        # [NEW] Class balance & weighting (was only printed, not saved)
         "class_counts": class_counts,
         "class_weight_map": {str(k): v for k, v in class_weight_map.items()},
-        # [NEW] Model intercept — needed to reproduce predictions from saved weights
         "intercept": float(clf.intercept_[0]),
     }
 
-    # [NEW] Bundle all token-level diagnostics for downstream analysis
+    # Bundle all token-level diagnostics for downstream analysis
     diagnostics = {
         # Predictions & scores: enable confusion matrices, PR curves, threshold tuning
         "y_true":     y_true,       # int array
@@ -240,7 +259,6 @@ def run_step_level(raw_dir, hook_name, num_shards, d_model, args):
     X = np.stack([step_sums[k] / step_counts[k] for k in keys]).astype(np.float32)
     y = np.array([1 if step_labels[k] else 0 for k in keys], dtype=np.int32)
 
-    # [NEW] Preserve token counts per step (noisy-mean diagnostic)
     counts = np.array([step_counts[k] for k in keys], dtype=np.int32)
 
     print(f"    Steps: {len(keys)}  |  Positive: {y.sum()}  |  Negative: {len(y)-y.sum()}")
@@ -249,7 +267,6 @@ def run_step_level(raw_dir, hook_name, num_shards, d_model, args):
 
     metrics, pipeline = _fit_cv_lr(X, y, args)
 
-    # [NEW] Bundle step-level diagnostics
     diagnostics = {
         "X": X,           # (n_steps, d_model) aggregated feature matrix
         "y": y,           # (n_steps,) labels
@@ -294,7 +311,6 @@ def run_sample_level(raw_dir, hook_name, num_shards, d_model,
 
     X = X[:len(y)]
 
-    # [NEW] Preserve token counts per sample
     counts = np.array([sample_counts[s] for s in sample_ids[:len(y)]], dtype=np.int32)
 
     print(f"    Samples: {len(y)}  |  Positive: {y.sum()}  |  Negative: {len(y)-y.sum()}")
@@ -303,7 +319,6 @@ def run_sample_level(raw_dir, hook_name, num_shards, d_model,
 
     metrics, pipeline = _fit_cv_lr(X, y, args)
 
-    # [NEW] Bundle sample-level diagnostics
     diagnostics = {
         "X": X,                   # (n_samples, d_model) aggregated feature matrix
         "y": y,                   # (n_samples,) labels
@@ -327,6 +342,9 @@ def _fit_cv_lr(X, y, args):
             C=args.C, max_iter=2000, solver="lbfgs",
             class_weight="balanced", random_state=args.seed)),
     ])
+    # in this case, C is the inverse of the L2 regularisation strength.
+    # What should be the ration between # data points and C value?
+    # should do a sweep of parameters
 
     n_folds = min(args.n_folds, min(np.bincount(y)))
     n_folds = max(n_folds, 2)
@@ -342,11 +360,9 @@ def _fit_cv_lr(X, y, args):
 
     metrics = {}
     for s in scoring:
-        # [NEW] Save per-fold arrays (enables paired tests, outlier detection)
         metrics[f"cv_{s}_folds"]      = cv_results[f"test_{s}"].tolist()
         metrics[f"cv_{s}_mean"]       = float(np.mean(cv_results[f"test_{s}"]))
         metrics[f"cv_{s}_std"]        = float(np.std(cv_results[f"test_{s}"]))
-        # [NEW] Save train fold arrays + std (overfitting diagnostic per fold)
         metrics[f"cv_{s}_train_folds"] = cv_results[f"train_{s}"].tolist()
         metrics[f"cv_{s}_train_mean"]  = float(np.mean(cv_results[f"train_{s}"]))
         metrics[f"cv_{s}_train_std"]   = float(np.std(cv_results[f"train_{s}"]))
@@ -356,20 +372,16 @@ def _fit_cv_lr(X, y, args):
     metrics["n_negative"] = int(len(y) - y.sum())
     metrics["n_folds"]    = n_folds
 
-    # [NEW] Model intercept — needed to reproduce predictions from saved weights
     metrics["intercept"] = float(lr_model.intercept_[0])
 
-    # [NEW] Convergence diagnostic: n_iter approaching max_iter is a red flag
     metrics["n_iter"] = int(lr_model.n_iter_[0])
     metrics["max_iter"] = 2000
 
-    # [NEW] Timing info from cross_validate
     metrics["cv_fit_time_mean"]   = float(np.mean(cv_results["fit_time"]))
     metrics["cv_fit_time_std"]    = float(np.std(cv_results["fit_time"]))
     metrics["cv_score_time_mean"] = float(np.mean(cv_results["score_time"]))
     metrics["cv_score_time_std"]  = float(np.std(cv_results["score_time"]))
 
-    # [NEW] Scaler statistics for step/sample level
     cv_scaler = pipeline.named_steps["scaler"]
     metrics["scaler_mean_norm"] = float(np.linalg.norm(cv_scaler.mean_))
     metrics["scaler_var_mean"]  = float(np.mean(cv_scaler.var_))
@@ -405,7 +417,7 @@ def compare_weights(pipeline_or_clf, scaler, layers_dict, hook_name):
 
 
 # ==========================================
-# [NEW] Cross-granularity weight comparison
+# Cross-granularity weight comparison
 # ==========================================
 def compute_cross_granularity_similarities(all_learned_weights):
     """
@@ -464,7 +476,7 @@ def main():
 
     all_results = {}
     all_learned_weights = {}
-    all_diagnostics = {}            # [NEW] collector for per-layer/gran diagnostics
+    all_diagnostics = {}            
 
     for layer in args.target_layers:
         hook_name = f"blocks.{layer}.hook_out"
@@ -510,9 +522,9 @@ def main():
                         print(f"      {vn:<45}: {cs:+.4f}")
 
             layer_results[gran] = metrics
-            layer_diagnostics[gran] = diagnostics   # [NEW]
+            layer_diagnostics[gran] = diagnostics  
 
-            # Extract weight vectors (unchanged logic)
+            # Extract weight vectors 
             if gran == "token":
                 w_raw = clf.coef_[0] / (scaler.scale_ + 1e-12)
                 # Project intercept into input space to match w_raw
@@ -536,7 +548,7 @@ def main():
         all_diagnostics[str(layer)] = layer_diagnostics
 
     # ------------------------------------------------------------------
-    # [NEW] Cross-granularity & cross-layer weight cosine similarities
+    # Cross-granularity & cross-layer weight cosine similarities
     # ------------------------------------------------------------------
     cross_sims = compute_cross_granularity_similarities(all_learned_weights)
     all_results["cross_weight_similarities"] = cross_sims
@@ -563,7 +575,7 @@ def main():
     torch.save(all_learned_weights, weights_path)
     print(f"Weights saved → {weights_path}")
 
-    # 3. [NEW] Full diagnostics bundle (one .pt file per layer to stay memory-friendly)
+    # 3. Full diagnostics bundle (one .pt file per layer)
     diag_dir = os.path.join(args.output_dir, "diagnostics")
     os.makedirs(diag_dir, exist_ok=True)
     for layer_key, layer_diag in all_diagnostics.items():
