@@ -40,6 +40,10 @@ Usage:
 
 - for the load_translation_wmt, concatenate also the de german translation, so as to complete the task:
 
+NEED TO CONTROL FOR:
+LENGTH
+KEYWORD APPEARANCE
+CHAT TEMPLATE
 
 """
 

@@ -18,6 +18,11 @@ unsure whether transofomers' AutoTokenizer applies the chat template by default!
 control for:
 - chat template
 - keywords in format (Problem, Reasoning, Explanation, The correct answer is ...) (to do in build_eval_dataset_for_layer_selection.py)
+
+Supports three vector sources via --vector_source:
+  - "reasoning"  : mean-difference reasoning direction vectors from the .pt vector file
+  - "lr"         : LR classifier weight vectors from lr_learned_weights.pt
+  - "both"       : evaluate both side by side
 """
 
 import os
@@ -32,13 +37,30 @@ import re
 parser = argparse.ArgumentParser(
     description="Evaluate reasoning vectors across layers for optimal selection."
 )
-parser.add_argument("--gpu", type=str, default="4")
-parser.add_argument("--vector_file", type=str, required=True,
-                    help="Path to .pt file with reasoning vectors (must have 'layers' key)")
-parser.add_argument("--eval_datasets", type=str, nargs="+", required=True,
+parser.add_argument("--gpu", type=str, default="0")
+parser.add_argument("--vector_file", type=str, default=None,
+                    help="Path to .pt file with reasoning vectors (must have 'layers' key). "
+                         "Required when --vector_source is 'reasoning' or 'both'.")
+parser.add_argument("--lr_weights_file", type=str, default=None,
+                    help="Path to lr_learned_weights.pt from the LR classifier. "
+                         "Required when --vector_source is 'lr' or 'both'.")
+parser.add_argument("--vector_source", type=str, default="both",
+                    choices=["reasoning", "lr", "both"],
+                    help="Which vector families to evaluate and plot: "
+                         "'reasoning' = mean-difference directions only, "
+                         "'lr' = LR classifier weights only, "
+                         "'both' = all vectors side by side.")
+parser.add_argument("--eval_datasets", type=str, nargs="+",
+                    default=[
+                        "/home/ines/Reasoning-activations/reasoning_datasets/eval_data_layer_selection/reasoning_eval.jsonl",
+                        "/home/ines/Reasoning-activations/reasoning_datasets/eval_data_layer_selection/non_reasoning_hard.jsonl",
+                        "/home/ines/Reasoning-activations/reasoning_datasets/eval_data_layer_selection/non_reasoning_easy.jsonl",
+                    ],
                     help="Paths to evaluation .jsonl files (one per category)")
-parser.add_argument("--eval_labels", type=str, nargs="+", required=True,
+parser.add_argument("--eval_labels", type=str, nargs="+",
+                    default=["reasoning", "non_reasoning_hard", "non_reasoning_easy"],
                     help="Labels for each dataset (e.g., 'reasoning' 'non_reasoning_hard' 'non_reasoning_easy')")
+
 parser.add_argument("--target_layers", type=int, nargs="+", default=list(range(18, 29)))
 parser.add_argument("--model_name", type=str, default="Qwen/Qwen3-8B")
 parser.add_argument("--batch_size", type=int, default=8)
@@ -57,6 +79,14 @@ parser.add_argument("--chat_template", action="store_true",
                     help="Include this flag to apply the chat template.")
 
 args = parser.parse_args()
+
+# --- Validate required files for selected vector_source ---
+if args.vector_source in ("reasoning", "both") and args.vector_file is None:
+    print("ERROR: --vector_file is required when --vector_source is 'reasoning' or 'both'.")
+    sys.exit(1)
+if args.vector_source in ("lr", "both") and args.lr_weights_file is None:
+    print("ERROR: --lr_weights_file is required when --vector_source is 'lr' or 'both'.")
+    sys.exit(1)
 
 if len(args.eval_datasets) != len(args.eval_labels):
     print("ERROR: --eval_datasets and --eval_labels must have the same number of entries.")
@@ -84,7 +114,7 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 # ==========================================
 # Candidate vectors to evaluate
 # ==========================================
-TARGET_VECTORS = [
+REASONING_VECTORS = [
     "reasoning_direction_token_cleaned",
     "reasoning_direction_sample_cleaned",
     "reasoning_direction_step_cleaned",
@@ -93,7 +123,99 @@ TARGET_VECTORS = [
     "reasoning_direction_step",
 ]
 
+LR_WEIGHT_VECTORS = [
+    "lr_weight_token",
+    "lr_weight_step",
+    "lr_weight_sample",
+]
 
+# ==========================================
+# Plotting style registry
+# ==========================================
+# Colors: one hue per granularity. Reasoning directions = blue/orange/green.
+# LR weights = pink/purple/brown. Solid = cleaned or LR, dashed = raw.
+PLOT_COLORS = {
+    "reasoning_direction_token_cleaned":  "#2196F3",
+    "reasoning_direction_sample_cleaned": "#FF9800",
+    "reasoning_direction_step_cleaned":   "#4CAF50",
+    "reasoning_direction_token":          "#2196F3",
+    "reasoning_direction_sample":         "#FF9800",
+    "reasoning_direction_step":           "#4CAF50",
+    "lr_weight_token":                    "#E91E63",
+    "lr_weight_step":                     "#9C27B0",
+    "lr_weight_sample":                   "#795548",
+}
+
+PLOT_LINESTYLES = {
+    "reasoning_direction_token_cleaned":  "-",
+    "reasoning_direction_sample_cleaned": "-",
+    "reasoning_direction_step_cleaned":   "-",
+    "reasoning_direction_token":          "--",
+    "reasoning_direction_sample":         "--",
+    "reasoning_direction_step":           "--",
+    "lr_weight_token":                    "-",
+    "lr_weight_step":                     "-",
+    "lr_weight_sample":                   "-",
+}
+
+PLOT_SHORT_NAMES = {
+    "reasoning_direction_token_cleaned":  "Token (cleaned)",
+    "reasoning_direction_sample_cleaned": "Sample (cleaned)",
+    "reasoning_direction_step_cleaned":   "Step (cleaned)",
+    "reasoning_direction_token":          "Token (raw)",
+    "reasoning_direction_sample":         "Sample (raw)",
+    "reasoning_direction_step":           "Step (raw)",
+    "lr_weight_token":                    "LR Token",
+    "lr_weight_step":                     "LR Step",
+    "lr_weight_sample":                   "LR Sample",
+}
+
+
+# ==========================================
+# LR learned-weight loader
+# ==========================================
+def load_lr_learned_weights(
+    weights_path: str,
+    target_layers: list[int],
+    device,
+    dtype=torch.bfloat16,
+) -> dict:
+    """
+    Load LR classifier weight vectors from lr_learned_weights.pt and reshape
+    them into the same  {layer: {vector_name: tensor}}  structure used by the
+    evaluation pipeline.
+
+    The LR file stores:
+        {str(layer): {"token": w, "step": w, "sample": w}}
+
+    We emit:
+        {int(layer): {"lr_weight_token": w, "lr_weight_step": w, "lr_weight_sample": w}}
+
+    Vectors are L2-normalised so that downstream cosine similarity is meaningful
+    (the LR weight magnitudes are arbitrary and depend on regularisation).
+    """
+    raw = torch.load(weights_path, map_location="cpu", weights_only=False)
+
+    vectors: dict[int, dict[str, torch.Tensor]] = {}
+    for layer in target_layers:
+        layer_key = str(layer)
+        if layer_key not in raw:
+            print(f"  Warning: layer {layer} not found in {weights_path}, skipping")
+            continue
+        vectors[layer] = {}
+        for gran, w in raw[layer_key].items():          # gran ∈ {"token", "step", "sample"}
+            vec = w.to(device=device, dtype=dtype)
+            # vec = F.normalize(vec.unsqueeze(0), dim=-1).squeeze(0)   # unit-norm for cosine sim
+            vectors[layer][f"lr_weight_{gran}"] = vec
+
+    loaded_summary = {l: list(v.keys()) for l, v in vectors.items()}
+    print(f"  Loaded LR weight vectors: {loaded_summary}")
+    return vectors
+
+
+# ==========================================
+# Data loading helpers
+# ==========================================
 def load_eval_data_with_chat_template(file_path: str, tokenizer, label: str) -> list[dict]:
     """Load a .jsonl evaluation file. Each line needs a 'problem' field."""
     samples = []
@@ -144,6 +266,10 @@ def load_eval_data(file_path: str, tokenizer, label: str) -> list[dict]:
             })
     return samples
 
+
+# ==========================================
+# Activation extraction helpers
+# ==========================================
 def extract_boundary_activation(
     hidden_states: torch.Tensor,
     attention_mask: torch.Tensor,
@@ -258,6 +384,9 @@ def per_token_cosine_aggregate(
     return scores
 
 
+# ==========================================
+# Discriminability metrics
+# ==========================================
 def compute_discriminability_metrics(
     positive_scores: np.ndarray,
     negative_scores: np.ndarray,
@@ -290,12 +419,6 @@ def compute_discriminability_metrics(
     std_neg = np.std(negative_scores, ddof=1)
 
     # Cohen's d (pooled std)
-    # Standardizes the raw difference between the mean scores of your target files, divided by pooled variance. 
-    # A score $d > 0.8$ represents a huge gap; 
-    # a positive value indicates the vector successfully records higher metrics for true logical sequences
-    # How many standard deviations apart the means of the two distributions are. 
-    # It tells you if the gap between reasoning and non-reasoning is massive or negligible relative 
-    # to the natural variance of the scores.
     n_pos, n_neg = len(positive_scores), len(negative_scores)
     pooled_std = np.sqrt(
         ((n_pos - 1) * std_pos**2 + (n_neg - 1) * std_neg**2) / (n_pos + n_neg - 2)
@@ -303,12 +426,6 @@ def compute_discriminability_metrics(
     cohens_d = (mean_pos - mean_neg) / (pooled_std + 1e-10)
 
     # AUROC
-    # Evaluates classification performance. If you used these vectors to build an automated detector, 
-    # an AUROC of 1.0 means perfect discrimination, whereas 0.5 represents random flipping of a coin.
-    # The probability that a randomly chosen reasoning sample will score higher than a randomly chosen non-reasoning sample. 
-    # It evaluates classification power independent of a specific decision threshold.
-    # AUROC evaluates the vector's ability to separate the two classes independent of any specific threshold.
-    
     labels = np.concatenate([np.ones(n_pos), np.zeros(n_neg)])
     scores = np.concatenate([positive_scores, negative_scores])
     try:
@@ -317,14 +434,9 @@ def compute_discriminability_metrics(
         auroc = 0.5
 
     # Selectivity ratio
-    # The specificity of the vector activation. 
-    # It checks whether the vector is purely measuring reasoning, 
-    # or if it is generally active across all kinds of text.
     selectivity = mean_pos / (abs(mean_neg) + 1e-8)
 
     # Mann-Whitney U test
-    # Formulates an exact statistical check ensuring 
-    # the separation is genuine rather than an artifact of random sampling noise.
     try:
         _, p_value = stats.mannwhitneyu(positive_scores, negative_scores, alternative="greater")
     except ValueError:
@@ -345,7 +457,9 @@ def compute_discriminability_metrics(
     }
 
 
-
+# ==========================================
+# Plotting
+# ==========================================
 def plot_layer_selection(
     all_metrics: dict,
     sorted_layers: list[int],
@@ -364,32 +478,6 @@ def plot_layer_selection(
     n_neg = len(neg_labels)
     vec_names = list(all_metrics.keys())
 
-    # Color scheme: one hue per granularity, solid=cleaned / dashed=raw
-    colors = {
-        "reasoning_direction_token_cleaned": "#2196F3",
-        "reasoning_direction_sample_cleaned": "#FF9800",
-        "reasoning_direction_step_cleaned": "#4CAF50",
-        "reasoning_direction_token": "#2196F3",
-        "reasoning_direction_sample": "#FF9800",
-        "reasoning_direction_step": "#4CAF50",
-    }
-    linestyles = {
-        "reasoning_direction_token_cleaned": "-",
-        "reasoning_direction_sample_cleaned": "-",
-        "reasoning_direction_step_cleaned": "-",
-        "reasoning_direction_token": "--",
-        "reasoning_direction_sample": "--",
-        "reasoning_direction_step": "--",
-    }
-    short_names = {
-        "reasoning_direction_token_cleaned": "Token (cleaned)",
-        "reasoning_direction_sample_cleaned": "Sample (cleaned)",
-        "reasoning_direction_step_cleaned": "Step (cleaned)",
-        "reasoning_direction_token": "Token (raw)",
-        "reasoning_direction_sample": "Sample (raw)",
-        "reasoning_direction_step": "Step (raw)",
-    }
-
     fig = plt.figure(figsize=(6 * n_neg, 14))
     gs = gridspec.GridSpec(3, n_neg, hspace=0.35, wspace=0.3)
 
@@ -406,10 +494,10 @@ def plot_layer_selection(
             ax1.plot(
                 sorted_layers, aurocs,
                 marker="o", markersize=4,
-                linestyle=linestyles.get(v_name, "-"),
-                color=colors.get(v_name, "gray"),
+                linestyle=PLOT_LINESTYLES.get(v_name, "-"),
+                color=PLOT_COLORS.get(v_name, "gray"),
                 linewidth=2,
-                label=short_names.get(v_name, v_name),
+                label=PLOT_SHORT_NAMES.get(v_name, v_name),
             )
         ax1.axhline(y=0.5, color="gray", linestyle=":", alpha=0.5, label="Chance")
         ax1.set_ylabel("AUROC", fontsize=11)
@@ -432,10 +520,10 @@ def plot_layer_selection(
             ax2.plot(
                 sorted_layers, ds,
                 marker="s", markersize=4,
-                linestyle=linestyles.get(v_name, "-"),
-                color=colors.get(v_name, "gray"),
+                linestyle=PLOT_LINESTYLES.get(v_name, "-"),
+                color=PLOT_COLORS.get(v_name, "gray"),
                 linewidth=2,
-                label=short_names.get(v_name, v_name),
+                label=PLOT_SHORT_NAMES.get(v_name, v_name),
             )
         ax2.axhline(y=0, color="gray", linestyle=":", alpha=0.5)
         ax2.axhline(y=0.8, color="green", linestyle="--", alpha=0.3, label="Large effect (0.8)")
@@ -457,10 +545,10 @@ def plot_layer_selection(
                 all_metrics[v_name].get((layer, neg_label), {}).get("mean_neg", 0)
                 for layer in sorted_layers
             ]
-            c = colors.get(v_name, "gray")
-            ls = linestyles.get(v_name, "-")
+            c = PLOT_COLORS.get(v_name, "gray")
+            ls = PLOT_LINESTYLES.get(v_name, "-")
             ax3.plot(sorted_layers, mean_pos, marker="o", markersize=4,
-                     linestyle=ls, color=c, linewidth=2, label=f"{short_names.get(v_name)} (reasoning)")
+                     linestyle=ls, color=c, linewidth=2, label=f"{PLOT_SHORT_NAMES.get(v_name)} (reasoning)")
             ax3.plot(sorted_layers, mean_neg, marker="x", markersize=4,
                      linestyle=ls, color=c, linewidth=1.5, alpha=0.5)
 
@@ -478,7 +566,6 @@ def plot_layer_selection(
         fig.text(0.5, 0.94, subtitle, ha='center', fontsize=12, style='italic', color='dimgray')
         
     plt.savefig(save_path, dpi=200, bbox_inches="tight")
-
 
     print(f"Plot saved → {save_path}")
 
@@ -543,15 +630,20 @@ def print_recommendation(all_metrics: dict, sorted_layers: list[int], neg_labels
     print(f"{'=' * 100}\n")
 
 
+# ==========================================
+# Main
+# ==========================================
 def main(args):
     os.makedirs(args.output_dir, exist_ok=True)
 
     print(f"=== Reasoning Vector Layer Selection Evaluation ===")
-    print(f"Model:         {args.model_name}")
-    print(f"Vector file:   {args.vector_file}")
-    print(f"Datasets:      {list(zip(args.eval_labels, args.eval_datasets))}")
-    print(f"Layers:        {args.target_layers}")
-    print(f"Token mode:    {args.token_positions}")
+    print(f"Model:          {args.model_name}")
+    print(f"Vector source:  {args.vector_source}")
+    print(f"Vector file:    {args.vector_file}")
+    print(f"LR weights:     {args.lr_weights_file}")
+    print(f"Datasets:       {list(zip(args.eval_labels, args.eval_datasets))}")
+    print(f"Layers:         {args.target_layers}")
+    print(f"Token mode:     {args.token_positions}")
 
     # ==========================================
     # Load model & tokenizer
@@ -569,31 +661,54 @@ def main(args):
     model.eval()
 
     # ==========================================
-    # Load reasoning vectors
+    # Load vectors according to --vector_source
     # ==========================================
-    print("Loading reasoning vectors...")
-    vector_data = torch.load(args.vector_file, map_location="cpu")
-    layers_dict = vector_data["layers"]
+    reasoning_vectors: dict[int, dict[str, torch.Tensor]] = {}
 
-    reasoning_vectors = {}
-    for layer in args.target_layers:
-        layer_key = f"blocks.{layer}.hook_out"
-        if layer_key not in layers_dict:
-            print(f"  Warning: {layer_key} not found, skipping layer {layer}")
-            continue
-        reasoning_vectors[layer] = {}
-        for v_name in TARGET_VECTORS:
-            if v_name in layers_dict[layer_key]:
-                vec = layers_dict[layer_key][v_name].to(
-                    device=model.device, dtype=torch.bfloat16
-                )
-                reasoning_vectors[layer][v_name] = vec
+    # --- Mean-difference reasoning direction vectors ---
+    if args.vector_source in ("reasoning", "both"):
+        print("Loading reasoning direction vectors...")
+        vector_data = torch.load(args.vector_file, map_location="cpu", weights_only=False)
+        layers_dict = vector_data["layers"]
 
+        for layer in args.target_layers:
+            layer_key = f"blocks.{layer}.hook_out"
+            if layer_key not in layers_dict:
+                print(f"  Warning: {layer_key} not found in vector_file, skipping layer {layer}")
+                continue
+            if layer not in reasoning_vectors:
+                reasoning_vectors[layer] = {}
+            for v_name in REASONING_VECTORS:
+                if v_name in layers_dict[layer_key]:
+                    vec = layers_dict[layer_key][v_name].to(
+                        device=model.device, dtype=torch.bfloat16
+                    )
+                    reasoning_vectors[layer][v_name] = vec
+
+        n_rv = sum(len(v) for v in reasoning_vectors.values())
+        print(f"  Loaded {n_rv} reasoning direction entries across {len(reasoning_vectors)} layers")
+
+    # --- LR classifier weight vectors ---
+    if args.vector_source in ("lr", "both"):
+        print("Loading LR classifier weight vectors...")
+        lr_vecs = load_lr_learned_weights(
+            args.lr_weights_file, args.target_layers, model.device
+        )
+        for layer, vdict in lr_vecs.items():
+            if layer not in reasoning_vectors:
+                reasoning_vectors[layer] = {}
+            reasoning_vectors[layer].update(vdict)
+
+    # --- Build availability sets ---
     available_layers = sorted(reasoning_vectors.keys())
     available_vectors = set()
     for layer in available_layers:
         available_vectors.update(reasoning_vectors[layer].keys())
-    print(f"  Loaded {len(available_vectors)} vector types across {len(available_layers)} layers")
+    print(f"  Total: {len(available_vectors)} vector types across {len(available_layers)} layers")
+
+    if not available_layers:
+        print("ERROR: No vectors loaded for any target layer. Check your files.")
+        sys.exit(1)
 
     # ==========================================
     # Load evaluation datasets
@@ -702,24 +817,31 @@ def main(args):
                 all_metrics[v_name][(layer, neg_label)] = metrics
 
     # ==========================================
-    # Extract Dataset Information
+    # Extract Dataset Information for file naming
     # ==========================================
-    # Extract baseline_dataset from vector_file string
-    base_name = os.path.basename(args.vector_file)
-    name_no_ext = os.path.splitext(base_name)[0]
-    
-    # Clean the prefix to isolate "cleaned_joint_fineweb_deepmind_math"
-    # Handling typical reasoning vector prefixes
-    baseline_dataset = re.sub(r'^reasoning_vectors_(with_step_)?', '', name_no_ext)
+    # Build a descriptive tag from whichever files were provided
+    if args.vector_file:
+        base_name = os.path.basename(args.vector_file)
+        name_no_ext = os.path.splitext(base_name)[0]
+        baseline_dataset = re.sub(r'^reasoning_vectors_(with_step_)?', '', name_no_ext)
+    elif args.lr_weights_file:
+        base_name = os.path.basename(args.lr_weights_file)
+        name_no_ext = os.path.splitext(base_name)[0]
+        baseline_dataset = name_no_ext
+    else:
+        baseline_dataset = "unknown"
 
     # Determine if chat template was used
     chat_suffix = "_with_chat_template" if args.chat_template else ""
 
+    # Include vector_source in the file suffix so outputs don't overwrite each other
+    source_tag = args.vector_source  # "reasoning", "lr", or "both"
+
     # Establish the conditional file suffix
     if args.token_positions == "topk_mean" and args.topk_pct is not None:
-         file_suffix = f"{baseline_dataset}_{args.token_positions}_{args.topk_pct}{chat_suffix}"
+         file_suffix = f"{baseline_dataset}_{source_tag}_{args.token_positions}_{args.topk_pct}{chat_suffix}_not_normalized"
     else:
-         file_suffix = f"{baseline_dataset}_{args.token_positions}{chat_suffix}"
+         file_suffix = f"{baseline_dataset}_{source_tag}_{args.token_positions}{chat_suffix}_not_normalized"
 
     # ==========================================
     # Save raw results
@@ -752,8 +874,6 @@ def main(args):
                     for k, v in m.items()
                 }
 
-    # results_path = os.path.join(args.output_dir, "layer_selection_results.json")
-    # Dynamically inject naming requirements 
     results_path = os.path.join(args.output_dir, f"layer_selection_results_{file_suffix}.json")
 
     with open(results_path, "w") as f:
@@ -768,16 +888,12 @@ def main(args):
     # ==========================================
     # Plot
     # ==========================================
-    # plot_path = args.plot_file or os.path.join(args.output_dir, "layer_selection.png")
-    # Create the subtitle string
-    subtitle_text = f"Baseline Dataset: {baseline_dataset} | Token mode: {args.token_positions}"
+    subtitle_text = f"Source: {source_tag} | Dataset: {baseline_dataset} | Token mode: {args.token_positions}"
     if args.token_positions == "topk_mean" and args.topk_pct is not None:
         subtitle_text += f" | Top-K: {args.topk_pct}%"
 
-    # Dynamically inject naming requirements 
     plot_path = args.plot_file or os.path.join(args.output_dir, f"layer_selection_{file_suffix}.png")
     
-    # Pass the subtitle
     plot_layer_selection(all_metrics, available_layers, neg_labels, plot_path, subtitle=subtitle_text)
 
     print("Done!")
@@ -786,15 +902,34 @@ def main(args):
 if __name__ == "__main__":
     main(args)
 
-# # Top-10% mean of per-token cosine sims
-#python layer_selection_evaluation.py --token_positions topk_mean --topk_pct 10 ...
+# ==========================================
+# Example usage
+# ==========================================
 
-# 95th percentile
-#python layer_selection_evaluation.py --token_positions percentile_95 ...
+# --- Reasoning directions only ---
+# python3 layer_selection_eval.py \
+#   --vector_source reasoning \
+#   --vector_file /path/to/reasoning_vectors.pt \
+#   --eval_datasets .../reasoning_eval.jsonl .../non_reasoning_hard.jsonl .../non_reasoning_easy.jsonl \
+#   --eval_labels reasoning non_reasoning_hard non_reasoning_easy \
+#   --token_positions topk_mean --topk_pct 10
 
-# 99th percentile  
-#python layer_selection_evaluation.py --token_positions percentile_99 ...
+# --- LR classifier weights only ---
+# python3 layer_selection_eval.py \
+#   --vector_source lr \
+#   --lr_weights_file /path/to/results/lr_classifier/lr_learned_weights.pt \
+#   --eval_datasets .../reasoning_eval.jsonl .../non_reasoning_hard.jsonl .../non_reasoning_easy.jsonl \
+#   --eval_labels reasoning non_reasoning_hard non_reasoning_easy \
+#   --token_positions topk_mean --topk_pct 10
 
-# python3 /home/ines/Reasoning-activations/src/03_analyse_reasoning_vectors/layer_selection_eval.py --vector_file /home/ines/Reasoning-activations/reasoning_vectors/Qwen3-8B/processbench/reasoning_vectors_with_step_cleaned_fineweb.pt --eval_datasets /home/ines/Reasoning-activations/reasoning_datasets/eval_data_layer_selection/non_reasoning_easy.jsonl /home/ines/Reasoning-activations/reasoning_datasets/eval_data_layer_selection/non_reasoning_hard.jsonl /home/ines/Reasoning-activations/reasoning_datasets/eval_data_layer_selection/reasoning_eval.jsonl --eval_labels  non_reasoning_easy non_reasoning_hard reasoning  --target_layers 18 19 20 21 22 23 24 25 26 27 28 --model_name Qwen/Qwen3-8B --output_dir /home/ines/Reasoning-activations/results/02_validation_exp/layer_selection --token_positions topk_mean --topk_pct 10
+# --- Both side by side ---
+# python3 layer_selection_eval.py \
+#   --vector_source both \
+#   --vector_file /path/to/reasoning_vectors.pt \
+#   --lr_weights_file /path/to/results/lr_classifier/lr_learned_weights.pt \
+#   --eval_datasets .../reasoning_eval.jsonl .../non_reasoning_hard.jsonl .../non_reasoning_easy.jsonl \
+#   --eval_labels reasoning non_reasoning_hard non_reasoning_easy \
+#   --token_positions topk_mean --topk_pct 10
 
-# python3 /home/ines/Reasoning-activations/src/03_analyse_reasoning_vectors/layer_selection_eval.py  --vector_file /home/ines/Reasoning-activations/reasoning_vectors/Qwen3-8B/processbench/reasoning_vectors_with_step_cleaned_joint_fineweb_deepmind_math.pt --eval_datasets /home/ines/Reasoning-activations/reasoning_datasets/eval_data_layer_selection/non_reasoning_easy.jsonl /home/ines/Reasoning-activations/reasoning_datasets/eval_data_layer_selection/non_reasoning_hard.jsonl /home/ines/Reasoning-activations/reasoning_datasets/eval_data_layer_selection/reasoning_eval.jsonl --eval_labels  non_reasoning_easy non_reasoning_hard reasoning --token_positions topk_mean --topk_pct 10 --chat_template
+
+# python3 layer_selection_eval.py --vector_source lr --lr_weights_file /home/ines/Reasoning-activations/results/lr_classifier/lr_learned_weights.pt  --token_positions topk_mean --topk_pct 10

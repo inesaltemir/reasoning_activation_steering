@@ -1,6 +1,6 @@
 """
 Script to run forward passes and extract layer-wise activations for the model in two distinct modes: 'reasoning' and 'baseline'. 
-- In 'reasoning' mode, it aligns tokens with logical steps from the ProcessBench dataset to compute mean activation vectors for correct and incorrect reasoning tokens/steps. 
+- In 'reasoning' mode, it aligns tokens with logical steps from the ProcessBench or Math-Shepherd dataset to compute mean activation vectors for correct and incorrect reasoning tokens/steps. 
 - In 'baseline' mode, it extracts base activations from the FineWeb dataset and computes PCA components to capture baseline language variance.
 
 Type of output:
@@ -16,26 +16,23 @@ a `.pt` reasoning-vectors file, where for each layer we store:
   - `mean_incorrect_step`:        mean_incorrect_step,
   - `reasoning_direction_step`:   mean_correct_step - mean_incorrect_step,
 
-Note: we DO save the raw activation value for each token
+Note: we DO save the raw activation value for each token, but only global means for (in)correct tokens, steps and samples. 
 
 Structure:
-- Arguments: can specifiy '--type reasoning' and '--type baseline'.
+- Arguments: can specifiy '--type reasoning' and '--type baseline', and '--dataset processbench' or '--dataset math-shepherd'.
 - Helper function for reasoning dataset ProcessBench: `prepare_prompt_and_labels_processbench` aligns character offsets to specific reasoning steps to label tokens as correct/incorrect.
+- Helper function for Math-Shepherd: `prepare_prompt_and_labels_mathshepherd` uses per-step boolean labels directly.
 - Reasoning mode (`run_reasoning`): use TransformerLens/TransformerBridge to inject custom hooks, extracting and aggregating token-level and step-level means.
 - Baseline mode (`run_baseline`): stream the FineWeb dataset via HuggingFace `AutoModelForCausalLM`, extract hidden states, and calculate a 50% variance PCA.
 - The `DiskBackedActivationStore` class: it handles sharding, buffering, and saving raw tensors and aligned metadata to disk.
 
-
-For the step-level granularity labelling, everything beyond the first incorrect step is skipped -- does not contribute to running_sum_INcorrect_step
-BUT during the token-level loop (which runs right before the step loop), tokens belonging to steps past first_err_idx will have an is_correct label of False (assigned by prepare_prompt_and_labels_processbench). 
-Therefore, at the token level, those trailing tokens do contribute to running_sum_incorrect. --> and it is at that is_correct label to which I look in the training of LR
 """
 
 
 
 import os
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"] = "4"
+os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 
 import argparse
 import torch
@@ -55,11 +52,6 @@ TARGET_LAYERS = [18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28]
 
 MODEL_SLUG = MODEL_NAME.split("/")[-1]
 
-# --- Reasoning-mode config ---
-REASONING_DATASET = "ProcessBench"
-REASONING_DATASET_TAG = REASONING_DATASET.lower()
-DATASET_FILE = os.path.join("reasoning_datasets", REASONING_DATASET, "dataset.jsonl")
-
 # --- Baseline-mode config ---
 BASELINE_DATASET_TAG = "fineweb"
 NUM_SAMPLES = 20000
@@ -67,24 +59,6 @@ MAX_LENGTH = 1024
 START_TOKEN_IDX = 5
 DATASET_NAME = "HuggingFaceFW/fineweb"
 DATASET_CONFIG = "sample-10BT"
-
-# --- Output directory roots ---
-LOG_DIR = os.path.join("logs", MODEL_SLUG, REASONING_DATASET_TAG)
-VECTOR_DIR = os.path.join("reasoning_vectors", MODEL_SLUG, REASONING_DATASET_TAG)
-
-# --- Directory for raw per-token activation shards ---
-RAW_ACTIVATIONS_DIR = os.path.join(VECTOR_DIR, "raw_activations")
-
-os.makedirs(LOG_DIR, exist_ok=True)
-os.makedirs(VECTOR_DIR, exist_ok=True)
-os.makedirs(RAW_ACTIVATIONS_DIR, exist_ok=True)
-
-# --- Fully-qualified file paths ---
-REASONING_LOG_FILE    = os.path.join(LOG_DIR,    f"reasoning_analysis_{MODEL_SLUG}_{REASONING_DATASET_TAG}_with_steps_avg_storage.log")
-REASONING_OUTPUT_FILE = os.path.join(VECTOR_DIR, f"reasoning_vectors_{MODEL_SLUG}_{REASONING_DATASET_TAG}_with_steps_avg_storage.pt")
-
-BASELINE_LOG_FILE    = os.path.join(LOG_DIR,    f"fineweb_baseline_{MODEL_SLUG}_{NUM_SAMPLES}_storage.log")
-BASELINE_OUTPUT_FILE = os.path.join(VECTOR_DIR, f"fineweb_activations_{MODEL_SLUG}_{NUM_SAMPLES}_storage.pt")
 
 # --- Memory management config ---
 # Max number of token-rows to buffer in RAM before flushing to disk.
@@ -226,11 +200,41 @@ def parse_args():
         "--type",
         required=True,
         choices=["reasoning", "baseline"],
-        help="Analysis mode: 'reasoning' uses ProcessBench + TransformerBridge, "
+        help="Analysis mode: 'reasoning' uses a reasoning dataset + TransformerBridge, "
              "'baseline' uses FineWeb + AutoModelForCausalLM.",
+    )
+    parser.add_argument(
+        "--dataset",
+        default="processbench",
+        choices=["processbench", "math-shepherd", "prm800k"],
+        help="Reasoning dataset to use (only relevant when --type=reasoning). "
+             "Default: processbench.",
+    )
+    parser.add_argument(
+        "--dataset-file",
+        default=None,
+        help="Path to the dataset .jsonl file. If not provided, defaults to "
+             "reasoning_datasets/<dataset>/dataset.jsonl for ProcessBench or "
+             "/home/ines/Reasoning-activations/reasoning_datasets/math_shepherd/math_shepherd_dataset_3000samples.jsonl"
+             "for Math-Shepherd.",
     )
     return parser.parse_args()
 
+
+def resolve_dataset_config(args):
+    """Return (dataset_tag, dataset_file) based on parsed args."""
+    if args.dataset == "processbench":
+        tag = "processbench"
+        default_file = os.path.join("reasoning_datasets", "ProcessBench", "dataset.jsonl")
+    elif args.dataset == "math-shepherd":
+        tag = "math-shepherd"
+        default_file = "/home/ines/Reasoning-activations/reasoning_datasets/math_shepherd/math_shepherd_dataset_3000samples.jsonl"
+    else:  # prm800k
+        tag = "prm800k"
+        default_file = "/home/ines/Reasoning-activations/reasoning_datasets/prm800k/prm800k_phase2_test_cleaned_multiple_traj.jsonl"
+
+    dataset_file = args.dataset_file if args.dataset_file else default_file
+    return tag, dataset_file
 
 # ==========================================
 # Logging helper
@@ -310,15 +314,219 @@ def prepare_prompt_and_labels_processbench(sample, tokenizer):
 
 
 # ==========================================
+# Math-Shepherd helpers  (reasoning mode)
+# ==========================================
+def prepare_prompt_and_labels_mathshepherd(sample, tokenizer):
+    """Aligns Math-Shepherd steps with token positions using per-step labels.
+
+    Math-Shepherd provides a boolean `step_labels` list, so each step has its
+    own independent correctness label (unlike ProcessBench where correctness
+    is derived from first-error-index).
+
+    Returns
+    -------
+    input_ids : torch.Tensor  shape (1, seq_len)
+    token_metadata : list[dict]  per-token {is_correct, step_idx}
+    first_error_token_idx : int   (-1 if none)
+    reasoning_start_token_idx : int
+    """
+    full_text = "Problem:\n" + sample["problem"] + "\n\nReasoning:\n"
+    char_regions = [{"start": 0, "end": len(full_text), "step_idx": -1, "is_correct": None}]
+
+    step_labels = sample["step_labels"]  # list[bool], per-step correctness
+
+    for idx, step in enumerate(sample["steps"]):
+        start_char = len(full_text)
+        step_text = f"Step {idx + 1}: {step}\n"
+        full_text += step_text
+        end_char = len(full_text)
+
+        # Use the per-step label directly
+        is_correct = step_labels[idx] if idx < len(step_labels) else None
+
+        char_regions.append(
+            {"start": start_char, "end": end_char,
+             "step_idx": idx, "is_correct": is_correct}
+        )
+
+    encoding = tokenizer(full_text, return_offsets_mapping=True)
+    input_ids = torch.tensor(encoding["input_ids"]).unsqueeze(0)
+    offsets = encoding["offset_mapping"]
+
+    # Find the first error step index for first_error_token_idx tracking
+    first_error_step_idx = sample.get("label", -1)
+
+    token_metadata = []
+    first_error_token_idx = -1
+    reasoning_start_token_idx = -1
+
+    for pos, (start, end) in enumerate(offsets):
+        assigned_region = next(
+            (r for r in char_regions if start >= r["start"] and end <= r["end"]), None
+        )
+        if assigned_region:
+            step_idx = assigned_region["step_idx"]
+
+            if reasoning_start_token_idx == -1 and step_idx == 0:
+                reasoning_start_token_idx = pos
+
+            if (
+                first_error_token_idx == -1
+                and step_idx >= 0
+                and assigned_region["is_correct"] is False
+            ):
+                first_error_token_idx = pos
+
+            token_metadata.append({"is_correct": assigned_region["is_correct"], "step_idx": step_idx})
+        else:
+            token_metadata.append({"is_correct": None, "step_idx": -1})
+
+    return input_ids, token_metadata, first_error_token_idx, reasoning_start_token_idx
+
+# ==========================================
+# PRM800K helpers  (reasoning mode)
+# ==========================================
+def prepare_prompt_and_labels_prm800k(sample, tokenizer):
+    """Aligns PRM800K steps with token positions, treating every completion
+    within each step as an independently-labelled sub-step.
+
+    PRM800K structure:
+        sample["problem"]  : str
+        sample["steps"]    : list of step dicts, each with:
+            step["completions"] : list of completion dicts, each with:
+                completion["text"]   : str
+                completion["rating"] : int  (-1, 0, or +1)
+
+    Each completion is appended to the full text and assigned its own
+    char region with:
+        step_label  : raw rating value (-1, 0, +1)
+        is_correct  : True if rating in {0, +1}, False if rating == -1
+
+    The step_idx encodes both the parent step and the completion index as
+    a flat counter so that downstream step-level averaging treats each
+    completion as its own independent unit.
+
+    Returns
+    -------
+    input_ids               : torch.Tensor  shape (1, seq_len)
+    token_metadata          : list[dict]    per-token dicts with keys:
+                                  is_correct, step_idx, step_label
+    first_error_token_idx   : int   (-1 if no incorrect completion found)
+    reasoning_start_token_idx : int
+    """
+    full_text = "Problem:\n" + sample["problem"] + "\n\nReasoning:\n"
+    char_regions = [
+        {"start": 0, "end": len(full_text),
+         "step_idx": -1, "is_correct": None, "step_label": None}
+    ]
+
+    flat_step_idx = 0          # monotonically increasing across all completions
+    first_error_found = False
+
+    for step in sample["steps"]:
+        for completion in step.get("completions", []):
+            text    = completion.get("text", "")
+            rating  = completion.get("rating", None)
+
+            # rating → is_correct
+            if rating == -1:
+                is_correct = False
+            elif rating in (0, 1):
+                is_correct = True
+            else:
+                is_correct = None   # flagged / missing rating
+
+            start_char = len(full_text)
+            full_text += text + "\n"
+            end_char = len(full_text)
+
+            char_regions.append({
+                "start":      start_char,
+                "end":        end_char,
+                "step_idx":   flat_step_idx,
+                "is_correct": is_correct,
+                "step_label": rating,        # raw -1 / 0 / +1
+            })
+            flat_step_idx += 1
+
+    encoding = tokenizer(full_text, return_offsets_mapping=True)
+    input_ids = torch.tensor(encoding["input_ids"]).unsqueeze(0)
+    offsets   = encoding["offset_mapping"]
+
+    token_metadata            = []
+    first_error_token_idx     = -1
+    reasoning_start_token_idx = -1
+
+    for pos, (start, end) in enumerate(offsets):
+        assigned_region = next(
+            (r for r in char_regions if start >= r["start"] and end <= r["end"]),
+            None,
+        )
+        if assigned_region:
+            step_idx   = assigned_region["step_idx"]
+            is_correct = assigned_region["is_correct"]
+
+            # Mark the first reasoning token (first completion, flat_step_idx == 0)
+            if reasoning_start_token_idx == -1 and step_idx == 0:
+                reasoning_start_token_idx = pos
+
+            # Mark the first token of the first incorrect completion
+            if (
+                first_error_token_idx == -1
+                and step_idx >= 0
+                and is_correct is False
+            ):
+                first_error_token_idx = pos
+
+            token_metadata.append({
+                "is_correct": is_correct,
+                "step_idx":   step_idx,
+                "step_label": assigned_region["step_label"],
+            })
+        else:
+            token_metadata.append({
+                "is_correct": None,
+                "step_idx":   -1,
+                "step_label": None,
+            })
+
+    return input_ids, token_metadata, first_error_token_idx, reasoning_start_token_idx
+
+# ==========================================
 # REASONING MODE
 # ==========================================
-def run_reasoning():
-    setup_logging(REASONING_LOG_FILE)
+def run_reasoning(dataset_tag, dataset_file):
+    # --- Build paths from dataset tag ---
+    log_dir = os.path.join("logs", MODEL_SLUG, dataset_tag)
+    vector_dir = os.path.join("reasoning_vectors", MODEL_SLUG, dataset_tag)
+    raw_activations_dir = os.path.join(vector_dir, "raw_activations")
+
+    os.makedirs(log_dir, exist_ok=True)
+    os.makedirs(vector_dir, exist_ok=True)
+    os.makedirs(raw_activations_dir, exist_ok=True)
+
+    reasoning_log_file = os.path.join(
+        log_dir, f"reasoning_analysis_{MODEL_SLUG}_{dataset_tag}_with_steps_avg_storage.log"
+    )
+    reasoning_output_file = os.path.join(
+        vector_dir, f"reasoning_vectors_{MODEL_SLUG}_{dataset_tag}_with_steps_avg_storage.pt"
+    )
+
+    setup_logging(reasoning_log_file)
 
     logging.info(f"[reasoning] Model: {MODEL_NAME} | Layers: {TARGET_LAYERS}")
-    logging.info(f"Log  → {REASONING_LOG_FILE}")
-    logging.info(f"Out  → {REASONING_OUTPUT_FILE}")
-    logging.info(f"Raw  → {RAW_ACTIVATIONS_DIR}")
+    logging.info(f"[reasoning] Dataset: {dataset_tag} | File: {dataset_file}")
+    logging.info(f"Log  → {reasoning_log_file}")
+    logging.info(f"Out  → {reasoning_output_file}")
+    logging.info(f"Raw  → {raw_activations_dir}")
+
+    # --- Choose the prompt-builder based on dataset ---
+    if dataset_tag == "processbench":
+        prepare_fn = prepare_prompt_and_labels_processbench
+    elif dataset_tag == "math-shepherd":
+        prepare_fn = prepare_prompt_and_labels_mathshepherd
+    else:  # prm800k
+        prepare_fn = prepare_prompt_and_labels_prm800k
 
     from transformer_lens.model_bridge import TransformerBridge
 
@@ -342,7 +550,7 @@ def run_reasoning():
 
     # -- Initialise disk-backed store for ALL per-token activations --
     disk_store = DiskBackedActivationStore(
-        root_dir=RAW_ACTIVATIONS_DIR,
+        root_dir=raw_activations_dir,
         hook_names=target_names_list,
         d_model=d_model,
         max_tokens_in_ram=CHUNK_FLUSH_TOKENS,
@@ -366,12 +574,12 @@ def run_reasoning():
     # -- Load dataset --
     dataset = []
     try:
-        with open(DATASET_FILE, "r", encoding="utf-8") as f:
+        with open(dataset_file, "r", encoding="utf-8") as f:
             for line in f:
                 dataset.append(json.loads(line.strip()))
-        logging.info(f"Loaded {len(dataset)} samples from {DATASET_FILE}.")
+        logging.info(f"Loaded {len(dataset)} samples from {dataset_file}.")
     except FileNotFoundError:
-        logging.error(f"Dataset file '{DATASET_FILE}' not found. Run format_dataset.py first.")
+        logging.error(f"Dataset file '{dataset_file}' not found.")
         return
 
     # -- Forward passes --
@@ -379,7 +587,7 @@ def run_reasoning():
         for i, sample in enumerate(tqdm(dataset, desc="Forward Passes")):
             try:
                 tokens, token_labels, first_error_token_idx, reasoning_start_token_idx = (
-                    prepare_prompt_and_labels_processbench(sample, model.tokenizer)
+                    prepare_fn(sample, model.tokenizer)
                 )
                 tokens = tokens.to(model.cfg.device)
 
@@ -425,36 +633,89 @@ def run_reasoning():
                 # ---- Write ALL per-token activations to disk ----
                 disk_store.append(cache, token_meta_rows, sample_idx=i)
 
-                # STEP-LEVEL LOGIC 
-                label = sample.get("label")
-                if label == -1:
-                    for s_idx, indices in step_to_token_indices.items():
-                        if len(indices) > 0:
-                            for name in target_names_set:
-                                step_tokens = cache[name][0, indices, :]
-                                step_mean = step_tokens.mean(dim=0)
-                                running_sum_correct_step[name] += step_mean
-                            count_correct_steps += 1
-                else:
-                    first_err_idx = label
-
-                    for s_idx in range(first_err_idx):
-                        if s_idx in step_to_token_indices:
-                            indices = step_to_token_indices[s_idx]
+                # ---- STEP-LEVEL LOGIC ----
+                if dataset_tag == "processbench":
+                    # ProcessBench: label == -1 means all correct; otherwise
+                    # steps < label are correct, step == label is the first error.
+                    label = sample.get("label")
+                    if label == -1:
+                        for s_idx, indices in step_to_token_indices.items():
                             if len(indices) > 0:
                                 for name in target_names_set:
                                     step_tokens = cache[name][0, indices, :]
                                     step_mean = step_tokens.mean(dim=0)
                                     running_sum_correct_step[name] += step_mean
                                 count_correct_steps += 1
+                    else:
+                        first_err_idx = label
 
-                    if first_err_idx in step_to_token_indices:
-                        indices = step_to_token_indices[first_err_idx]
-                        if len(indices) > 0:
-                            for name in target_names_set:
-                                step_tokens = cache[name][0, indices, :]
-                                step_mean = step_tokens.mean(dim=0)
+                        for s_idx in range(first_err_idx):
+                            if s_idx in step_to_token_indices:
+                                indices = step_to_token_indices[s_idx]
+                                if len(indices) > 0:
+                                    for name in target_names_set:
+                                        step_tokens = cache[name][0, indices, :]
+                                        step_mean = step_tokens.mean(dim=0)
+                                        running_sum_correct_step[name] += step_mean
+                                    count_correct_steps += 1
+
+                        if first_err_idx in step_to_token_indices:
+                            indices = step_to_token_indices[first_err_idx]
+                            if len(indices) > 0:
+                                for name in target_names_set:
+                                    step_tokens = cache[name][0, indices, :]
+                                    step_mean = step_tokens.mean(dim=0)
+                                    running_sum_incorrect_step[name] += step_mean
+                                count_incorrect_steps += 1
+                elif dataset_tag == "math-shepherd":
+                    # Math-Shepherd: use per-step labels directly.
+                    # Each step is independently labeled correct/incorrect.
+                    step_labels = sample["step_labels"]
+                    for s_idx, indices in step_to_token_indices.items():
+                        if len(indices) == 0:
+                            continue
+                        if s_idx >= len(step_labels):
+                            continue
+
+                        step_is_correct = step_labels[s_idx]
+
+                        for name in target_names_set:
+                            step_tokens = cache[name][0, indices, :]
+                            step_mean = step_tokens.mean(dim=0)
+                            if step_is_correct:
+                                running_sum_correct_step[name] += step_mean
+                            else:
                                 running_sum_incorrect_step[name] += step_mean
+
+                        if step_is_correct:
+                            count_correct_steps += 1
+                        else:
+                            count_incorrect_steps += 1
+                else:
+                    # PRM800K: each flat_step_idx corresponds to one completion, already
+                    # labelled via is_correct in token_metadata. Read the label from the
+                    # first token of each step's indices — avoids any sample-field lookup.
+                    for s_idx, indices in step_to_token_indices.items():
+                        if len(indices) == 0:
+                            continue
+
+                        # All tokens in a step share the same is_correct; read from the first.
+                        step_is_correct = reasoning_metadata[indices[0]]["is_correct"]
+
+                        if step_is_correct is None:
+                            continue  # skip flagged / missing ratings
+
+                        for name in target_names_set:
+                            step_tokens = cache[name][0, indices, :]
+                            step_mean   = step_tokens.mean(dim=0)
+                            if step_is_correct:
+                                running_sum_correct_step[name]   += step_mean
+                            else:
+                                running_sum_incorrect_step[name] += step_mean
+
+                        if step_is_correct:
+                            count_correct_steps += 1
+                        else:
                             count_incorrect_steps += 1
 
                 # Per-sample mean across all reasoning tokens (kept for backward compat)
@@ -462,9 +723,15 @@ def run_reasoning():
                     sample_avg = cache[name].mean(dim=1).squeeze(0).clone()
                     per_sample_layer_means[name].append(sample_avg)
 
-                is_perfect_sample = (
-                    sample.get("label") == -1 and sample.get("final_answer_correct") is True
-                )
+                if dataset_tag == "processbench":
+                    # ProcessBench: a sample is "perfect" if label==-1 AND final_answer_correct
+                    is_perfect_sample = (
+                        sample.get("label") == -1 and sample.get("final_answer_correct") is True
+                    )
+                else:
+                    # Math-Shepherd: a sample is "perfect" if all step_labels are True
+                    is_perfect_sample = all(sample.get("step_labels", []))
+
                 per_sample_is_fully_correct.append(is_perfect_sample)
 
                 del cache, logits
@@ -530,6 +797,8 @@ def run_reasoning():
 
     results["metadata"] = {
         "model":                       MODEL_NAME,
+        "dataset":                     dataset_tag,
+        "dataset_file":                dataset_file,
         "target_layers":               TARGET_LAYERS,
         "count_correct_tokens":        count_correct,
         "count_incorrect_tokens":      count_incorrect,
@@ -537,13 +806,14 @@ def run_reasoning():
         "count_incorrect_steps":       count_incorrect_steps,
         "total_successful_samples":    len(per_sample_is_fully_correct),
         "per_sample_is_fully_correct": is_perfect_mask,
-        "raw_activations_dir":         RAW_ACTIVATIONS_DIR,
+        # Pointer to the raw activation store
+        "raw_activations_dir":         raw_activations_dir,
         "raw_activations_index":       store_index,
     }
 
-    torch.save(results, REASONING_OUTPUT_FILE)
-    logging.info(f"Saved reasoning vectors → {REASONING_OUTPUT_FILE}")
-    logging.info(f"Saved raw activations  → {RAW_ACTIVATIONS_DIR}  "
+    torch.save(results, reasoning_output_file)
+    logging.info(f"Saved reasoning vectors → {reasoning_output_file}")
+    logging.info(f"Saved raw activations  → {raw_activations_dir}  "
                  f"({store_index['total_token_rows']} token-rows, "
                  f"{store_index['num_shards']} shards)")
     logging.info(f"Token counts  → Correct: {count_correct}, Incorrect: {count_incorrect}")
@@ -621,11 +891,20 @@ def load_raw_activations(raw_dir: str, hook_name: str,
 # BASELINE MODE  (unchanged)
 # ==========================================
 def run_baseline():
-    setup_logging(BASELINE_LOG_FILE)
+    baseline_log_file = os.path.join("logs", MODEL_SLUG, "fineweb",
+                                     f"fineweb_baseline_{MODEL_SLUG}_{NUM_SAMPLES}_storage.log")
+    baseline_output_file = os.path.join("reasoning_vectors", MODEL_SLUG, "fineweb",
+                                        f"fineweb_activations_{MODEL_SLUG}_{NUM_SAMPLES}_storage.pt")
+    vector_dir = os.path.join("reasoning_vectors", MODEL_SLUG, "fineweb")
+
+    os.makedirs(os.path.dirname(baseline_log_file), exist_ok=True)
+    os.makedirs(vector_dir, exist_ok=True)
+
+    setup_logging(baseline_log_file)
 
     logging.info(f"[baseline] Model: {MODEL_NAME} | Layers: {TARGET_LAYERS}")
-    logging.info(f"Log  → {BASELINE_LOG_FILE}")
-    logging.info(f"Out  → {BASELINE_OUTPUT_FILE}")
+    logging.info(f"Log  → {baseline_log_file}")
+    logging.info(f"Out  → {baseline_output_file}")
 
     from transformers import AutoTokenizer, AutoModelForCausalLM
     from datasets import load_dataset
@@ -697,10 +976,10 @@ def run_baseline():
         pca_components[layer] = torch.tensor(pca.components_, dtype=torch.float32)
         logging.info(f"  Layer {layer}: {len(pca.components_)} components explain 50% variance.")
 
-    torch.save(results, BASELINE_OUTPUT_FILE)
-    logging.info(f"Saved FineWeb activations → {BASELINE_OUTPUT_FILE}")
+    torch.save(results, baseline_output_file)
+    logging.info(f"Saved FineWeb activations → {baseline_output_file}")
 
-    pca_output_file = os.path.join(VECTOR_DIR, f"fineweb_pca_components_{MODEL_SLUG}_{NUM_SAMPLES}.pt")
+    pca_output_file = os.path.join(vector_dir, f"fineweb_pca_components_{MODEL_SLUG}_{NUM_SAMPLES}.pt")
     torch.save({"layers": pca_components, "metadata": results["metadata"]}, pca_output_file)
     logging.info(f"Saved FineWeb PCA components → {pca_output_file}")
 
@@ -712,6 +991,8 @@ if __name__ == "__main__":
     args = parse_args()
 
     if args.type == "reasoning":
-        run_reasoning()
+        dataset_tag, dataset_file = resolve_dataset_config(args)
+        run_reasoning(dataset_tag, dataset_file)
     else:
         run_baseline()
+        

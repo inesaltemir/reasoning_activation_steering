@@ -33,6 +33,20 @@ Important parameters to justify / sweep over:
     pretty common
 n_folds == 5, standard value for cross-validation 
 
+
+holdout set with different kind of text -- eval data
+good separation from the get go
+
+no risk of overfitting with linear model
+
+more qualitative than quantitative
+are we separating correctly on the holdout set
+our expected thing is it will not qualitative search
+
+move to more powerful non linear model
+simple neural net (easy to get good level of non linearity separation power , relatively quick)
+
+tree models not good
 """
 
 import os
@@ -45,7 +59,7 @@ from collections import defaultdict
 from sklearn.linear_model import SGDClassifier, LogisticRegression
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
-from sklearn.model_selection import StratifiedKFold, cross_validate
+from sklearn.model_selection import StratifiedKFold, StratifiedGroupKFold, cross_validate
 from sklearn.metrics import roc_auc_score, accuracy_score, f1_score
 import warnings, gc
 warnings.filterwarnings("ignore")
@@ -62,7 +76,7 @@ def parse_args():
                    #default=[18])
                     default=[18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28])
     p.add_argument("--granularities", type=str, nargs="+",
-                   default=["token", "step", "sample"],
+                   default=["step", "sample"],
                    choices=["token", "step", "sample"])
     p.add_argument("--n_folds", type=int, default=5)
     p.add_argument("--seed", type=int, default=42)
@@ -71,7 +85,7 @@ def parse_args():
                    help="Number of full passes over shards for SGD token-level training")
     p.add_argument("--test_shards", type=int, default=4,
                    help="Number of shards held out for token-level testing")
-    p.add_argument("--output_dir", type=str, default="results/lr_classifier")
+    p.add_argument("--output_dir", type=str, default="/home/ines/Reasoning-activations/results/lr_classifier_no_leak")
     return p.parse_args()
 
 
@@ -229,6 +243,15 @@ def run_token_level(raw_dir, hook_name, num_shards, args):
 # ==========================================
 # STEP-LEVEL:  streaming aggregation → LR
 # ==========================================
+# Because in the src/02_collect_activations/run_fw_pass_with_step_averaging_storage.py, during the token-LEVEL loop, tokens belonging to steps past
+# first_err_idx will have an "is_correct" == False. ====> this label is later used for classifying step incorrectness here
+# so effectively, steps after the first incorrect step ARE catalogued as incorrect too
+# try with the opposite
+# easy check == same number of erroneous steps as erroneous samples
+
+# Here, agreggate all activ per step
+# might want to try variant with top-k activating tokens?
+
 def run_step_level(raw_dir, hook_name, num_shards, d_model, args):
     """
     Stream all shards, accumulate per-step (sample_idx, step_idx) sums
@@ -258,6 +281,7 @@ def run_step_level(raw_dir, hook_name, num_shards, d_model, args):
     keys = sorted(step_sums.keys())
     X = np.stack([step_sums[k] / step_counts[k] for k in keys]).astype(np.float32)
     y = np.array([1 if step_labels[k] else 0 for k in keys], dtype=np.int32)
+    groups = np.array([k[0] for k in keys])  # sample_idx per step
 
     counts = np.array([step_counts[k] for k in keys], dtype=np.int32)
 
@@ -265,7 +289,11 @@ def run_step_level(raw_dir, hook_name, num_shards, d_model, args):
 
     del step_sums, step_counts, step_labels; gc.collect()
 
-    metrics, pipeline = _fit_cv_lr(X, y, args)
+    # metrics, pipeline = _fit_cv_lr(X, y, args)
+    # DATA LEAKAGE!!!! In X, possess no information about sample idx!!! some steps belonging to a same sample might be divided between the train and test set
+    # use stratifiedk per group to solve leakage problem; attempts to return stratified folds with non-overlapping groups
+
+    metrics, pipeline = _fit_cv_lr(X, y, args, groups=groups)
 
     diagnostics = {
         "X": X,           # (n_steps, d_model) aggregated feature matrix
@@ -331,7 +359,7 @@ def run_sample_level(raw_dir, hook_name, num_shards, d_model,
 # ==========================================
 # Shared: CV logistic regression for step/sample
 # ==========================================
-def _fit_cv_lr(X, y, args):
+def _fit_cv_lr(X, y, args, groups=None):
     """Stratified K-fold CV on a StandardScaler → LR pipeline."""
     if len(np.unique(y)) < 2:
         return {"error": "single_class"}, None
@@ -346,13 +374,21 @@ def _fit_cv_lr(X, y, args):
     # What should be the ration between # data points and C value?
     # should do a sweep of parameters
 
-    n_folds = min(args.n_folds, min(np.bincount(y)))
-    n_folds = max(n_folds, 2)
-    cv = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=args.seed)
-
     scoring = ["accuracy", "roc_auc", "f1", "precision", "recall"]
-    cv_results = cross_validate(pipeline, X, y, cv=cv, scoring=scoring,
-                                return_train_score=True)
+
+    if groups is not None:
+        n_groups = len(np.unique(groups))
+        n_folds = min(args.n_folds, min(np.bincount(y)), n_groups)
+        n_folds = max(n_folds, 2)
+        cv = StratifiedGroupKFold(n_splits=n_folds, shuffle=True, random_state=args.seed)
+        cv_results = cross_validate(pipeline, X, y, cv=cv, scoring=scoring,
+                                    return_train_score=True, groups=groups)
+    else:
+        n_folds = min(args.n_folds, min(np.bincount(y)))
+        n_folds = max(n_folds, 2)
+        cv = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=args.seed)
+        cv_results = cross_validate(pipeline, X, y, cv=cv, scoring=scoring,
+                                    return_train_score=True)
 
     pipeline.fit(X, y)
 
