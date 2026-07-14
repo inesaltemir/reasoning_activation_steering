@@ -65,19 +65,18 @@ def parse_args():
     p.add_argument("--raw_dir", type=str,
                    default="/home/ines/Reasoning-activations/reasoning_vectors/Qwen3-8B/processbench/raw_activations")
     p.add_argument("--vectors_file", type=str,
-                   default="/home/ines/Reasoning-activations/reasoning_vectors/Qwen3-8B/processbench/"
-                           "reasoning_vectors_Qwen3-8B_processbench_with_steps_avg_storage.pt")
+                   default="/home/ines/Reasoning-activations/reasoning_vectors/Qwen3-8B/processbench/reasoning_vectors_Qwen3-8B_processbench_with_steps_avg_storage.pt")
     p.add_argument("--target_layers", type=int, nargs="+",
                    default=[18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28])
     p.add_argument("--granularities", type=str, nargs="+",
-                   default=["step"],
+                   default=["sample"],
                    choices=["token", "step", "sample"])
     p.add_argument("--n_folds", type=int, default=5)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--C", type=float, default=1.0)
     p.add_argument("--sgd_epochs", type=int, default=5)
     p.add_argument("--test_shards", type=int, default=4)
-    p.add_argument("--output_dir", type=str, default="/home/ines/Reasoning-activations/results/lr_classifier_controls")
+    p.add_argument("--output_dir", type=str, default="/home/ines/Reasoning-activations/results/lr_classifier_controls_sample_granularity/processbench")
     # Control-specific
     p.add_argument("--n_permutations", type=int, default=20,
                    help="Number of label permutations for the permutation test")
@@ -526,14 +525,14 @@ def run_controls_sample_level(raw_dir, hook_name, num_shards, d_model,
     results = {"real_classifier": real_metrics}
 
     # Control 1: Permutation
-    print(f"    [Control 1] Permutation test...")
-    results["ctrl1_permutation"] = control_permutation(X, y, args, args.n_permutations)
-    real_auroc = real_metrics["cv_roc_auc_mean"]
-    null_aurocs = results["ctrl1_permutation"]["null_aurocs"]
-    p_value = float(np.mean([na >= real_auroc for na in null_aurocs]))
-    results["ctrl1_permutation"]["empirical_p_value"] = p_value
-    print(f"      Real AUROC: {real_auroc:.4f} | Null: "
-          f"{results['ctrl1_permutation']['null_auroc_mean']:.4f} | p={p_value:.3f}")
+    #print(f"    [Control 1] Permutation test...")
+    #results["ctrl1_permutation"] = control_permutation(X, y, args, args.n_permutations)
+    #real_auroc = real_metrics["cv_roc_auc_mean"]
+    #null_aurocs = results["ctrl1_permutation"]["null_aurocs"]
+    #p_value = float(np.mean([na >= real_auroc for na in null_aurocs]))
+    #results["ctrl1_permutation"]["empirical_p_value"] = p_value
+    #print(f"      Real AUROC: {real_auroc:.4f} | Null: "
+    #      f"{results['ctrl1_permutation']['null_auroc_mean']:.4f} | p={p_value:.3f}")
 
     # Control 3: Token-count-only (no position for sample-level)
     print(f"    [Control 3] Token-count-only baseline...")

@@ -54,6 +54,37 @@ def extract_layer_series(data):
 
     return layers_int, series
 
+def extract_layer_series_sample_granularity(data):
+    """Extract per-layer AUROC for each control, assuming sample-level granularity."""
+    layers = sorted(data.keys(), key=int)
+    layers_int = [int(l) for l in layers]
+
+    series = {
+        "real":           [],
+        "token_count":    [],
+        "random_proj":    [],
+    }
+    # Train AUROCs for overfitting gap
+    series["real_train"] = []
+
+    for l in layers:
+        step = data[l].get("sample", {})
+        series["real"].append(step.get("real_classifier", {}).get("cv_roc_auc_mean", np.nan))
+        series["real_train"].append(step.get("real_classifier", {}).get("cv_roc_auc_train_mean", np.nan))
+        #series["position_only"].append(step.get("ctrl2_position_only", {}).get("cv_roc_auc_mean", np.nan))
+        series["token_count"].append(step.get("ctrl3_token_count_only", {}).get("cv_roc_auc_mean", np.nan))
+        #series["residualized"].append(step.get("ctrl4_position_residualized", {}).get("cv_roc_auc_mean", np.nan))
+        #series["within_problem"].append(step.get("ctrl5_within_problem", {}).get("cv_roc_auc_mean", np.nan))
+        #series["pos_and_length"].append(step.get("ctrl7_position_and_length", {}).get("cv_roc_auc_mean", np.nan))
+
+        rp = step.get("ctrl6_random_projection", {})
+        series["random_proj"].append(rp.get("random_auroc_mean", np.nan))
+
+        #r4 = step.get("ctrl4_position_residualized", {})
+        #series["r2_position"].append(r4.get("r2_position_explains", np.nan))
+
+    return layers_int, series
+
 
 def plot_main_comparison(layers, series, save_dir):
     """Main panel: real classifier vs all controls across layers."""
@@ -62,24 +93,53 @@ def plot_main_comparison(layers, series, save_dir):
     ax.plot(layers, series["real"], "o-", color="#2563EB", lw=2.5, ms=6,
             label="Real classifier", zorder=5)
     ax.plot(layers, series["residualized"], "s--", color="#7C3AED", lw=2, ms=5,
-            label="After regressing out position (Ctrl 4)")
+            label="After regressing out position")
     ax.plot(layers, series["within_problem"], "^--", color="#059669", lw=2, ms=5,
-            label="Within-problem centered (Ctrl 5)")
+            label="Within-problem centered")
     ax.plot(layers, series["position_only"], "d-.", color="#DC2626", lw=1.8, ms=5,
-            label="Position-only (Ctrl 2)")
+            label="Position-only")
     ax.plot(layers, series["pos_and_length"], "p-.", color="#EA580C", lw=1.5, ms=5,
-            label="Position + length (Ctrl 7)")
+            label="Position + length of the step")
     ax.plot(layers, series["token_count"], "x-.", color="#9CA3AF", lw=1.5, ms=6,
-            label="Token-count-only (Ctrl 3)")
+            label="Length of the step") # Token-count-only
     ax.plot(layers, series["random_proj"], "v:", color="#6B7280", lw=1.5, ms=5,
-            label="Random projection (Ctrl 6)")
+            label="Random projection")
 
     ax.axhline(0.5, color="black", ls=":", lw=1, alpha=0.5, label="Chance")
 
     ax.set_xlabel("Layer", fontsize=12)
     ax.set_ylabel("AUROC (CV)", fontsize=12)
-    ax.set_title("LR Classifier vs. Control Baselines — Step Level", fontsize=13, fontweight="bold")
-    ax.legend(fontsize=8.5, loc="center left", bbox_to_anchor=(0.0, 0.35))
+    ax.set_title("Step-level MathShepherd LR classifier vs. control baselines", fontsize=13, fontweight="bold")
+    #ax.legend(fontsize=8.5, loc="center left", bbox_to_anchor=(0.0, 0.35))
+    ax.legend(fontsize=8.5, loc="center left", bbox_to_anchor=(1.05, 0.5))
+    ax.set_ylim(0.45, 0.92)
+    ax.xaxis.set_major_locator(mticker.MaxNLocator(integer=True))
+    ax.grid(True, alpha=0.2)
+
+    fig.tight_layout()
+    fig.savefig(save_dir / "control_baselines_main.png", dpi=180, bbox_inches="tight")
+    plt.show()
+    print(f"Saved → {save_dir / 'control_baselines_main.png'}")
+
+
+def plot_main_comparison_sample(layers, series, save_dir):
+    """Main panel: real classifier vs all controls across layers."""
+    fig, ax = plt.subplots(figsize=(10, 5.5))
+
+    ax.plot(layers, series["real"], "o-", color="#2563EB", lw=2.5, ms=6,
+            label="Real classifier", zorder=5)
+    ax.plot(layers, series["token_count"], "x-.", color="#9CA3AF", lw=1.5, ms=6,
+            label="Length of the step") # Token-count-only
+    ax.plot(layers, series["random_proj"], "v:", color="#6B7280", lw=1.5, ms=5,
+            label="Random projection")
+
+    ax.axhline(0.5, color="black", ls=":", lw=1, alpha=0.5, label="Chance")
+
+    ax.set_xlabel("Layer", fontsize=12)
+    ax.set_ylabel("AUROC (CV)", fontsize=12)
+    ax.set_title("Sample-level MathShepherd LR classifier vs. control baselines", fontsize=13, fontweight="bold") #
+    #ax.legend(fontsize=8.5, loc="center left", bbox_to_anchor=(0.0, 0.35))
+    ax.legend(fontsize=8.5, loc="center left", bbox_to_anchor=(1.05, 0.5))
     ax.set_ylim(0.45, 0.92)
     ax.xaxis.set_major_locator(mticker.MaxNLocator(integer=True))
     ax.grid(True, alpha=0.2)
@@ -202,20 +262,22 @@ def plot_auroc_delta(layers, series, save_dir):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input", type=str, default="/home/ines/Reasoning-activations/results/lr_classifier_controls/control_baselines_results.json")
-    parser.add_argument("--output_dir", type=str, default="/home/ines/Reasoning-activations/results/lr_classifier_controls")
+    parser.add_argument("--input", type=str, default="/home/ines/Reasoning-activations/results/lr_classifier_controls_step_granularity/math-shepherd/control_baselines_results.json")
+    parser.add_argument("--output_dir", type=str, default="/home/ines/Reasoning-activations/results/lr_classifier_controls_step_granularity/math-shepherd/")
     args = parser.parse_args()
 
     save_dir = Path(args.output_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
 
     data = load_results(args.input)
+    #layers, series = extract_layer_series_sample_granularity(data)
     layers, series = extract_layer_series(data)
 
+    #plot_main_comparison_sample(layers, series, save_dir)
     plot_main_comparison(layers, series, save_dir)
-    plot_signal_decomposition(layers, series, save_dir)
-    plot_overfitting_gap(layers, series, save_dir)
-    plot_auroc_delta(layers, series, save_dir)
+    #plot_signal_decomposition(layers, series, save_dir)
+    #plot_overfitting_gap(layers, series, save_dir)
+    #plot_auroc_delta(layers, series, save_dir)
 
 
 if __name__ == "__main__":

@@ -44,6 +44,7 @@ import argparse
 import json
 import warnings
 import gc
+import re
 from pathlib import Path
 from collections import defaultdict
 
@@ -56,17 +57,20 @@ parser = argparse.ArgumentParser(
 parser.add_argument("--gpu", type=str, default="0")
 parser.add_argument(
     "--activations_file", type=str,
+    #default="/home/ines/Reasoning-activations/reasoning_vectors/Qwen3-8B/math-shepherd/reasoning_vectors_Qwen3-8B_math-shepherd_with_steps_avg_storage.pt",
     default="/home/ines/Reasoning-activations/reasoning_vectors/Qwen3-8B/math-shepherd/reasoning_vectors_Qwen3-8B_math-shepherd_with_steps_avg_storage.pt",
-    help="Path to the .pt file produced by run_fw_pass_with_step_averaging_storage.py",
+    help="Path to the .pt file produced by run_fw_pass_with_step_averaging_storage.py. These activations constitute the evaluation dataset",
 )
 parser.add_argument(
     "--lr_weights_file", type=str,
-    default="/home/ines/Reasoning-activations/results/lr_classifier_no_leak/lr_learned_weights.pt",
+    #default="/home/ines/Reasoning-activations/results/lr_classifier_no_leak/lr_learned_weights.pt",
+    default="/home/ines/Reasoning-activations/results/lr_classifier_prm800k/lr_learned_weights.pt",
     help="Path to lr_learned_weights.pt",
 )
 parser.add_argument(
     "--lr_metrics_file", type=str,
-    default="/home/ines/Reasoning-activations/results/lr_classifier_no_leak/lr_classifier_results.json",
+    #default="/home/ines/Reasoning-activations/results/lr_classifier_no_leak/lr_classifier_results.json",
+    default="/home/ines/Reasoning-activations/results/lr_classifier_prm800k/lr_classifier_results.json",
     help="Path to lr_classifier_results.json (for intercepts).",
 )
 parser.add_argument(
@@ -75,7 +79,7 @@ parser.add_argument(
 )
 parser.add_argument(
     "--output_dir", type=str,
-    default="/home/ines/Reasoning-activations/results/lr_classifier_no_leak/eval_math_shepherd",
+    default="/home/ines/Reasoning-activations/results/lr_classifier_prm800k/eval_math_shepherd",
     help="Directory for output JSON and plots.",
 )
 parser.add_argument(
@@ -90,6 +94,13 @@ parser.add_argument(
 )
 
 args = parser.parse_args()
+
+# Extract dataset tags from paths
+_eval_match = re.search(r'/Qwen3-8B/([^/]+)/reasoning_vectors_', args.activations_file)
+evaluation_dataset_tag = _eval_match.group(1) if _eval_match else "unknown"
+
+_train_match = re.search(r'/results/lr_classifier_([^/]+)/lr_learned_weights', args.lr_weights_file)
+constituting_dataset_tag = _train_match.group(1) if _train_match else "unknown"
 
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
@@ -233,7 +244,7 @@ def compute_classifier_metrics(y_true: np.ndarray, y_scores: np.ndarray,
 # ==========================================
 def plot_classifier_results(clf_metrics: dict, sorted_layers: list,
                              granularities: list, eval_granularities: list,
-                             save_path: str, subtitle: str = ""):
+                             save_path: str, evaluation_dataset_tag: str, constituting_dataset_tag: str, subtitle: str = "",):
     """Accuracy / Precision / Recall / F1 / AUROC across layers."""
     metrics_to_plot = ["accuracy", "precision", "recall", "f1", "auroc"]
     metric_labels   = ["Accuracy", "Precision", "Recall", "F1 Score", "AUROC"]
@@ -279,7 +290,7 @@ def plot_classifier_results(clf_metrics: dict, sorted_layers: list,
                 ax.legend(fontsize=9, loc="best")
 
     fig.suptitle(
-        "LR Classifier on Math-Shepherd: Classifier Mode (Dot Product + Intercept)",
+        f"LR Classifier (train: {constituting_dataset_tag}) on {evaluation_dataset_tag}: Classifier Mode (Dot Product + Intercept)",
         fontsize=13, fontweight="bold", y=0.995,
     )
     if subtitle:
@@ -293,7 +304,7 @@ def plot_classifier_results(clf_metrics: dict, sorted_layers: list,
 
 def plot_confusion_matrices(clf_metrics: dict, sorted_layers: list,
                              granularities: list, eval_granularities: list,
-                             save_path: str):
+                             save_path: str, evaluation_dataset_tag: str, constituting_dataset_tag: str):
     """Stacked bar showing TP/TN/FP/FN composition across layers."""
     n_rows = len(granularities)
     n_cols = len(eval_granularities)
@@ -336,8 +347,8 @@ def plot_confusion_matrices(clf_metrics: dict, sorted_layers: list,
                 ax.legend(fontsize=7, loc="lower left",
                           bbox_to_anchor=(0, 1.02), ncol=4)
 
-    fig.suptitle("Confusion Matrix Composition Across Layers (Math-Shepherd)",
-                 fontsize=13, fontweight="bold", y=0.998)
+    fig.suptitle(f"Confusion Matrix Composition Across Layers — Eval: {evaluation_dataset_tag} | Train: {constituting_dataset_tag}",
+             fontsize=13, fontweight="bold", y=0.998)
     plt.savefig(save_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
     print(f"Confusion matrix plot saved → {save_path}")
@@ -384,7 +395,7 @@ def print_summary(clf_metrics: dict, sorted_layers: list,
                 best_score  = avg_auroc
                 best_choice = (lr_gran, layer, avg_auroc)
 
-    print(f"\n{'=' * 120}")
+    # print(f"\n{'=' * 120}")
     if best_choice:
         g, l, auc = best_choice
         print(f"  ★ BEST (avg AUROC across eval granularities): LR '{g}' at layer {l}  |  Avg AUROC = {auc:.4f}")
@@ -592,17 +603,17 @@ def main():
     # ------------------------------------------------------------------
     # Plots
     # ------------------------------------------------------------------
-    subtitle = f"Math-Shepherd | LR grans: {', '.join(granularities)}"
+    subtitle = f"Eval: {evaluation_dataset_tag} | Train: {constituting_dataset_tag} | LR grans: {', '.join(granularities)}"
 
     clf_plot_path = os.path.join(args.output_dir,
-                                 "eval_plot_classifier_math_shepherd.png")
+                                f"eval_plot_classifier_{evaluation_dataset_tag}.png")
     plot_classifier_results(clf_metrics, available_layers, granularities,
-                            eval_granularities, clf_plot_path, subtitle)
+                            eval_granularities, clf_plot_path, evaluation_dataset_tag, constituting_dataset_tag, subtitle)
 
     cm_plot_path = os.path.join(args.output_dir,
-                                "eval_plot_confusion_matrix_math_shepherd.png")
+                                f"eval_plot_confusion_matrix_{evaluation_dataset_tag}.png")
     plot_confusion_matrices(clf_metrics, available_layers, granularities,
-                            eval_granularities, cm_plot_path)
+                            eval_granularities, cm_plot_path, evaluation_dataset_tag, constituting_dataset_tag)
 
     print("Done!")
 

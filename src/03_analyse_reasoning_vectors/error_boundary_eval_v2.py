@@ -22,16 +22,30 @@ Three extraction modes at the boundary:
 NO MODEL LOADING, NO GPU, NO FORWARD PASSES.
 All activations are read from disk (raw_activations/).
 
-Usage
------
-python3 error_boundary_eval.py \\
-    --raw_dir       /path/to/raw_activations \\
-    --vector_file   /path/to/reasoning_vectors_...pt \\
-    --dataset_file  /path/to/ProcessBench/dataset.jsonl \\
-    --lr_weights_file /path/to/lr_learned_weights.pt \\
-    --lr_metrics_file /path/to/lr_classifier_results.json \\
-    --target_layers 18 19 20 21 22 23 24 25 26 27 28 \\
-    --window_size 5
+tests whether reasoning-direction vectors and the LR (logistic regression) classifier weights 
+actually capture a "reasoning quality" signal, 
+by checking how well they discriminate correct vs. incorrect reasoning 
+right at the point where an error occurs in ProcessBench samples.
+
+1. Build a boundary map — for each sample, find the token position where reasoning goes wrong 
+(first is_correct=False step from ProcessBench labels). For correct samples (no error), 
+it assigns a matched "control" position at the median relative error position across the dataset, 
+so correct/incorrect comparisons are positionally controlled.
+
+2. Extract activations around that boundary — 
+reads pre-computed activations from disk (no model/GPU needed) for a window of ±window_size tokens, 
+for each target layer.
+
+3. Score each sample two ways:
+Cosine similarity between the activation and a reasoning direction vector (works for any vector type).
+LR classifier score (w·h + b) using the actual trained logistic regression weights + intercept 
+
+Each is computed under three extraction modes: 
+exact (boundary token only)
+window_mean (average over the window)
+window_max (best single token in the window).
+
+Compute discriminability metrics comparing correct vs. incorrect scores
 """
 
 import os

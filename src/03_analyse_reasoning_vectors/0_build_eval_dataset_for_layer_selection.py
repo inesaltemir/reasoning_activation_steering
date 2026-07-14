@@ -1,4 +1,9 @@
 """
+OBSOLETE: was evaluating the existence of reasoning with my training on identifiyng correctness of the reasoning
+a bit misguided the goal
+(which separates reasoning text from
+non-reasoning text — essentially topic detection)
+
 ProcessBench has: gsm8k, Olympiadbench, Omnimath and MATH
 Keep in mind reasoning vector has been inferred from reasoning steps on math datasets!!!
 

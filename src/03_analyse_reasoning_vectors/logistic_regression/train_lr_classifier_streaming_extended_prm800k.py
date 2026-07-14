@@ -47,6 +47,8 @@ move to more powerful non linear model
 simple neural net (easy to get good level of non linearity separation power , relatively quick)
 
 tree models not good
+
+for PRM800K, need to stratify also at problem_id level! even if the prefix index is not the same, many prefix indexes share the problem definition
 """
 
 import os
@@ -95,13 +97,69 @@ def parse_args():
 # Shard loader (one at a time)
 # ==========================================
 def load_one_shard(raw_dir: Path, hook_name: str, shard_id: int):
-    """Load a single shard + its metadata.  Returns float32 tensor + list[dict]."""
+    """Load a single branch shard + its metadata.  Returns float32 tensor + list[dict]."""
     safe = hook_name.replace(".", "_")
     acts = torch.load(raw_dir / safe / f"shard_{shard_id:04d}.pt",
                       weights_only=False).to(torch.float32)
     meta = torch.load(raw_dir / f"meta_shard_{shard_id:04d}.pt",
                       weights_only=False)
     return acts, meta
+
+
+# ==========================================
+# PRM800K prefix cache loader
+# ==========================================
+def load_prefix_lookup(raw_dir: Path, hook_name: str, index: dict) -> dict:
+    """Load all prefix shards into a lookup dict: prefix_id → (acts np.ndarray, meta list).
+
+    Returns an empty dict when the dataset is not PRM800K (no prefix dedup).
+    The caller is responsible for deleting the returned dict when done to free RAM.
+
+    Parameters
+    ----------
+    raw_dir    : path to the raw_activations directory
+    hook_name  : e.g. "blocks.22.hook_out"
+    index      : the index.pt dict already loaded by the caller
+
+    Returns
+    -------
+    prefix_lookup : dict[int, tuple[np.ndarray, list[dict]]]
+                    prefix_id → (acts float32 (T_p, d_model), meta list[dict])
+                    Empty dict if no prefix dedup info found.
+    """
+    prefix_index     = index.get("prefix_index")       # list[(start_row, num_tokens)]
+    num_prefix_shards = index.get("num_prefix_shards", 0)
+
+    if not prefix_index or num_prefix_shards == 0:
+        return {}
+
+    safe        = hook_name.replace(".", "_")
+    prefix_safe = "prefix_" + safe
+
+    # Load all prefix shards into one flat tensor
+    p_acts_list, p_meta_list = [], []
+    for sid in range(num_prefix_shards):
+        p_acts_list.append(
+            torch.load(raw_dir / prefix_safe / f"shard_{sid:04d}.pt",
+                       weights_only=False).to(torch.float32).numpy()
+        )
+        p_meta_list.extend(
+            torch.load(raw_dir / "prefix_meta" / f"shard_{sid:04d}.pt",
+                       weights_only=False)
+        )
+
+    prefix_acts_flat = np.concatenate(p_acts_list, axis=0) if p_acts_list else np.empty((0,))
+    del p_acts_list
+
+    # Build lookup: prefix_id (== position in prefix_index list) → (acts slice, meta slice)
+    prefix_lookup: dict[int, tuple[np.ndarray, list]] = {}
+    for pid, (pstart, plen) in enumerate(prefix_index):
+        prefix_lookup[pid] = (
+            prefix_acts_flat[pstart: pstart + plen],   # view — no copy
+            p_meta_list[pstart: pstart + plen],
+        )
+
+    return prefix_lookup
 
 
 # ==========================================
@@ -251,30 +309,93 @@ def run_token_level(raw_dir, hook_name, num_shards, args):
 # try with the opposite
 # easy check == same number of erroneous steps as erroneous samples
 
-# Here, agreggate all activ per step
+# Here, aggregate all activ per step
 # might want to try variant with top-k activating tokens?
 
-def run_step_level(raw_dir, hook_name, num_shards, d_model, args):
+def run_step_level(raw_dir, hook_name, num_shards, d_model, args, index: dict):
     """
-    Stream all shards, accumulate per-step (sample_idx, step_idx) sums
-    and token counts.  After all shards: compute means → fit LR.
+    Stream all branch shards + prefix shards (PRM800K), accumulate per-step sums.
+
+    Parameters
+    ----------
+    index : the already-loaded index.pt dict (avoids re-reading from disk).
+
+    PRM800K dedup logic
+    -------------------
+    The on-disk format stores:
+      - branch shards : branch-only tokens, meta has (sample_idx, branch_idx, step_idx, …)
+      - prefix shards : prefix tokens stored ONCE per problem (sample_idx)
+
+    For step-level analysis we want:
+      - Each prefix step counted ONCE per problem (not once per branch).
+        Key = (sample_idx, step_idx).  Because all branches of the same problem share
+        sample_idx AND the same prefix step indices, the defaultdict key naturally
+        deduplicates: prefix tokens from every branch shard that share (sample_idx,
+        step_idx) would just keep accumulating — to avoid that we load prefix data
+        separately and add it only once per prefix_id, using the prefix_lookup.
+      - Each branch step counted once per branch.
+        Key = (sample_idx, branch_idx, step_idx).  branch_idx is stored in branch
+        metadata so different branches of the same problem do not collapse.
+
+    For non-PRM800K datasets (no prefix dedup) the logic is unchanged.
     """
+    has_prefix_dedup = bool(index.get("prefix_index") and index.get("num_prefix_shards", 0) > 0)
+
     step_sums   = defaultdict(lambda: np.zeros(d_model, dtype=np.float64))
     step_counts = defaultdict(int)
     step_labels = defaultdict(lambda: True)
 
-    print(f"    Streaming {num_shards} shards for step aggregation...")
+    # ------------------------------------------------------------------
+    # PRM800K path: seed step_sums with prefix data first (each prefix once)
+    # ------------------------------------------------------------------
+    if has_prefix_dedup:
+        print(f"    Loading prefix shards for step aggregation (PRM800K dedup)...")
+        prefix_lookup = load_prefix_lookup(raw_dir, hook_name, index)
+
+        for pid, (p_acts, p_meta) in prefix_lookup.items():
+            # p_meta rows contain: sample_idx, step_idx, is_correct (and problem_id etc.)
+            # We need the sample_idx of this prefix — take it from the first row.
+            if not p_meta:
+                continue
+            sample_idx = p_meta[0]["sample_idx"]
+            for row_i, m in enumerate(p_meta):
+                s_idx = m.get("step_idx", -1)
+                ic    = m.get("is_correct")
+                if s_idx < 0 or ic is None:
+                    continue
+                key = (sample_idx, s_idx)          # no branch_idx — prefix is shared
+                step_sums[key]   += p_acts[row_i].astype(np.float64)
+                step_counts[key] += 1
+                if ic is False:
+                    step_labels[key] = False
+
+        del prefix_lookup; gc.collect()
+
+    # ------------------------------------------------------------------
+    # Stream branch shards (or full-sequence shards for non-PRM800K)
+    # ------------------------------------------------------------------
+    print(f"    Streaming {num_shards} branch shards for step aggregation...")
     for sid in range(num_shards):
         acts, meta = load_one_shard(raw_dir, hook_name, sid)
         acts_np = acts.numpy().astype(np.float64)
 
         for i, m in enumerate(meta):
-            if m["step_idx"] < 0 or m["is_correct"] is None:
+            s_idx = m.get("step_idx", -1)
+            ic    = m.get("is_correct")
+            if s_idx < 0 or ic is None:
                 continue
-            key = (m["sample_idx"], m["step_idx"])
+
+            if has_prefix_dedup:
+                # Branch tokens: key includes branch_idx so each branch step is
+                # a distinct data point from other branches of the same problem.
+                b_idx = m.get("branch_idx", 0)
+                key = (m["sample_idx"], b_idx, s_idx)
+            else:
+                key = (m["sample_idx"], s_idx)
+
             step_sums[key]   += acts_np[i]
             step_counts[key] += 1
-            if m["is_correct"] is False:
+            if ic is False:
                 step_labels[key] = False
 
         del acts, acts_np, meta; gc.collect()
@@ -283,7 +404,8 @@ def run_step_level(raw_dir, hook_name, num_shards, d_model, args):
     keys = sorted(step_sums.keys())
     X = np.stack([step_sums[k] / step_counts[k] for k in keys]).astype(np.float32)
     y = np.array([1 if step_labels[k] else 0 for k in keys], dtype=np.int32)
-    groups = np.array([k[0] for k in keys])  # sample_idx per step
+    # groups = sample_idx (first element of key regardless of tuple length)
+    groups = np.array([k[0] for k in keys])
 
     counts = np.array([step_counts[k] for k in keys], dtype=np.int32)
 
@@ -291,17 +413,16 @@ def run_step_level(raw_dir, hook_name, num_shards, d_model, args):
 
     del step_sums, step_counts, step_labels; gc.collect()
 
-    # metrics, pipeline = _fit_cv_lr(X, y, args)
-    # DATA LEAKAGE!!!! In X, possess no information about sample idx!!! some steps belonging to a same sample might be divided between the train and test set
-    # use stratifiedk per group to solve leakage problem; attempts to return stratified folds with non-overlapping groups
-
+    # DATA LEAKAGE fix: use StratifiedGroupKFold so steps from the same sample
+    # are never split across train/test folds.
     metrics, pipeline = _fit_cv_lr(X, y, args, groups=groups)
 
     diagnostics = {
         "X": X,           # (n_steps, d_model) aggregated feature matrix
         "y": y,           # (n_steps,) labels
-        "keys": keys,     # list[(sample_idx, step_idx)] — row identity
-        "token_counts": counts,  # tokens aggregated per step
+        "keys": keys,     # list[tuple] — row identity (sample_idx[, branch_idx], step_idx)
+        "token_counts": counts,   # tokens aggregated per step
+        "has_prefix_dedup": has_prefix_dedup,
     }
     return metrics, pipeline, diagnostics
 
@@ -310,52 +431,203 @@ def run_step_level(raw_dir, hook_name, num_shards, d_model, args):
 # SAMPLE-LEVEL:  streaming aggregation → LR
 # ==========================================
 def run_sample_level(raw_dir, hook_name, num_shards, d_model,
-                     per_sample_is_fully_correct, args):
+                     per_sample_is_fully_correct, args, index: dict):
     """
-    Stream all shards, accumulate per-sample sums.
+    Stream all shards, accumulate per-sample (= per-sequence) sums.
+
+    Parameters
+    ----------
+    index : the already-loaded index.pt dict (avoids re-reading from disk).
+
+    PRM800K dedup logic
+    -------------------
+    On disk the prefix is stored once per problem (sample_idx) and each branch
+    is a separate branch shard entry tagged with (sample_idx, branch_idx).
+
+    We want N separate sequences for the N branches of a given problem, where
+    each sequence is the concatenation of:
+        prefix tokens  (shared, stored once)  +  branch tokens  (per-branch)
+
+    So the accumulation key is (sample_idx, branch_idx) — one row per branch.
+    The prefix contributions are reconstructed in-memory (never saved back to disk):
+      for each branch token encountered in a shard, we look up the prefix for that
+      problem and add it to the running sum for that (sample_idx, branch_idx) key,
+      but only ONCE (tracked via a "prefix_added" set).
+
+    The label for each (sample_idx, branch_idx) sequence is taken from
+    per_sample_is_fully_correct.  That mask is built in the forward pass as a flat
+    list over branches in dataset order, so its length equals the total number of
+    (sample_idx, branch_idx) entries.  We use a separate `branch_sequence_labels`
+    dict populated from per-branch meta to map (sample_idx, branch_idx) → label.
+
+    For non-PRM800K datasets the behaviour is identical to before: key = sample_idx.
     """
-    sample_sums   = defaultdict(lambda: np.zeros(d_model, dtype=np.float64))
-    sample_counts = defaultdict(int)
+    sample_index = index["sample_index"]
+    has_prefix_dedup = bool(index.get("prefix_index") and index.get("num_prefix_shards", 0) > 0)
 
-    print(f"    Streaming {num_shards} shards for sample aggregation...")
-    for sid in range(num_shards):
-        acts, meta = load_one_shard(raw_dir, hook_name, sid)
-        acts_np = acts.numpy().astype(np.float64)
+    if has_prefix_dedup:
+        # ----------------------------------------------------------------
+        # PRM800K path
+        # ----------------------------------------------------------------
+        print(f"    Loading prefix shards for sample aggregation (PRM800K dedup)...")
+        prefix_lookup = load_prefix_lookup(raw_dir, hook_name, index)
 
-        for i, m in enumerate(meta):
-            sid_sample = m["sample_idx"]
-            sample_sums[sid_sample]   += acts_np[i]
-            sample_counts[sid_sample] += 1
+        # Precompute prefix mean per prefix_id so we don't re-sum on every branch.
+        # shape: prefix_id → np.ndarray (d_model,) float64
+        prefix_means: dict[int, np.ndarray] = {}
+        prefix_lengths: dict[int, int] = {}
+        for pid, (p_acts, _) in prefix_lookup.items():
+            if len(p_acts) > 0:
+                prefix_means[pid]   = p_acts.astype(np.float64).sum(axis=0)
+                prefix_lengths[pid] = len(p_acts)
+        del prefix_lookup; gc.collect()
 
-        del acts, acts_np, meta; gc.collect()
+        # Accumulation keyed by (sample_idx, branch_idx)
+        # Running sums start from the prefix contribution (added lazily on first
+        # encounter of each branch in the shard stream).
+        sample_sums   = defaultdict(lambda: np.zeros(d_model, dtype=np.float64))
+        sample_counts = defaultdict(int)
+        prefix_added  = set()   # set of (sample_idx, branch_idx) already seeded with prefix
 
-    # Build X, y
-    sample_ids = sorted(sample_sums.keys())
-    X = np.stack([sample_sums[s] / sample_counts[s] for s in sample_ids]).astype(np.float32)
+        # Build a lookup from (sample_idx, branch_idx) → prefix_id using sample_index.
+        # sample_index entries for PRM800K are 4-tuples:
+        #   (start_row, num_branch_tokens, sample_idx, prefix_id)
+        # We derive branch_idx from the order branches appear per sample_idx.
+        branch_prefix_map: dict[tuple, int] = {}   # (sample_idx, branch_idx) → prefix_id
+        _branch_counter: dict[int, int] = defaultdict(int)
+        for entry in sample_index:
+            si    = entry[2]
+            pid   = entry[3]
+            b_idx = _branch_counter[si]
+            _branch_counter[si] += 1
+            branch_prefix_map[(si, b_idx)] = pid
+        del _branch_counter
 
-    y = np.array([
-        int(per_sample_is_fully_correct[s].item())
-        for s in sample_ids
-        if s < len(per_sample_is_fully_correct)
-    ], dtype=np.int32)
+        print(f"    Streaming {num_shards} branch shards for sample aggregation...")
+        for sid in range(num_shards):
+            acts, meta = load_one_shard(raw_dir, hook_name, sid)
+            acts_np = acts.numpy().astype(np.float64)
 
-    X = X[:len(y)]
+            for i, m in enumerate(meta):
+                s_idx = m["sample_idx"]
+                b_idx = m.get("branch_idx", 0)
+                key   = (s_idx, b_idx)
 
-    counts = np.array([sample_counts[s] for s in sample_ids[:len(y)]], dtype=np.int32)
+                # Seed with prefix sum on first encounter of this branch
+                if key not in prefix_added:
+                    pid = branch_prefix_map.get(key)
+                    if pid is not None and pid in prefix_means:
+                        sample_sums[key]   += prefix_means[pid]
+                        sample_counts[key] += prefix_lengths[pid]
+                    prefix_added.add(key)
 
-    print(f"    Samples: {len(y)}  |  Positive: {y.sum()}  |  Negative: {len(y)-y.sum()}")
+                sample_sums[key]   += acts_np[i]
+                sample_counts[key] += 1
 
-    del sample_sums, sample_counts; gc.collect()
+            del acts, acts_np, meta; gc.collect()
 
-    metrics, pipeline = _fit_cv_lr(X, y, args)
+        del prefix_means, prefix_lengths, prefix_added, branch_prefix_map; gc.collect()
 
-    diagnostics = {
-        "X": X,                   # (n_samples, d_model) aggregated feature matrix
-        "y": y,                   # (n_samples,) labels
-        "sample_ids": sample_ids[:len(y)],  # row→sample_idx mapping
-        "token_counts": counts,   # tokens aggregated per sample
-    }
-    return metrics, pipeline, diagnostics
+        # Build X, y
+        # Keys are (sample_idx, branch_idx); sort for determinism.
+        keys = sorted(sample_sums.keys())
+        X = np.stack([sample_sums[k] / sample_counts[k] for k in keys]).astype(np.float32)
+        counts = np.array([sample_counts[k] for k in keys], dtype=np.int32)
+        del sample_sums, sample_counts; gc.collect()
+
+        # Labels: per_sample_is_fully_correct is a flat list/tensor over all branches,
+        # ordered by their appearance in sample_index (i.e. the order they were stored
+        # during the forward pass).  We build a mapping from (sample_idx, branch_idx)
+        # to that flat position so we can look up the correct label for each sequence.
+
+        # Reconstruct flat index: sample_index entries appear in dataset order;
+        # to align with the sorted `keys`.
+        _bi_counter: dict[int, int] = defaultdict(int)
+        flat_index: dict[tuple, int] = {}   # (sample_idx, branch_idx) → flat position
+        for flat_pos, entry in enumerate(sample_index):
+            si    = entry[2]
+            b_idx = _bi_counter[si]
+            _bi_counter[si] += 1
+            flat_index[(si, b_idx)] = flat_pos
+
+        y = np.array([
+            int(per_sample_is_fully_correct[flat_index[k]].item())
+            if k in flat_index and flat_index[k] < len(per_sample_is_fully_correct)
+            else -1
+            for k in keys
+        ], dtype=np.int32)
+
+        # Drop rows with no label (shouldn't happen in practice)
+        valid = y >= 0
+        if not valid.all():
+            print(f"    Warning: dropping {(~valid).sum()} branch rows with no label.")
+            X      = X[valid]
+            y      = y[valid]
+            counts = counts[valid]
+            keys   = [k for k, v in zip(keys, valid) if v]
+
+        # groups = sample_idx for StratifiedGroupKFold (no cross-problem leakage)
+        groups = np.array([k[0] for k in keys])
+
+        print(f"    Sequences (prefix+branch): {len(y)}  |  Positive: {y.sum()}  |  Negative: {len(y)-y.sum()}")
+
+        metrics, pipeline = _fit_cv_lr(X, y, args, groups=groups)
+
+        diagnostics = {
+            "X": X,
+            "y": y,
+            "sequence_keys": keys,   # list[(sample_idx, branch_idx)]
+            "token_counts": counts,
+            "has_prefix_dedup": True,
+        }
+        return metrics, pipeline, diagnostics
+
+    else:
+        # ----------------------------------------------------------------
+        # Non-PRM800K path (original logic, unchanged)
+        # ----------------------------------------------------------------
+        sample_sums   = defaultdict(lambda: np.zeros(d_model, dtype=np.float64))
+        sample_counts = defaultdict(int)
+
+        print(f"    Streaming {num_shards} shards for sample aggregation...")
+        for sid in range(num_shards):
+            acts, meta = load_one_shard(raw_dir, hook_name, sid)
+            acts_np = acts.numpy().astype(np.float64)
+
+            for i, m in enumerate(meta):
+                sid_sample = m["sample_idx"]
+                sample_sums[sid_sample]   += acts_np[i]
+                sample_counts[sid_sample] += 1
+
+            del acts, acts_np, meta; gc.collect()
+
+        sample_ids = sorted(sample_sums.keys())
+        X = np.stack([sample_sums[s] / sample_counts[s] for s in sample_ids]).astype(np.float32)
+
+        y = np.array([
+            int(per_sample_is_fully_correct[s].item())
+            for s in sample_ids
+            if s < len(per_sample_is_fully_correct)
+        ], dtype=np.int32)
+
+        X = X[:len(y)]
+
+        counts = np.array([sample_counts[s] for s in sample_ids[:len(y)]], dtype=np.int32)
+
+        print(f"    Samples: {len(y)}  |  Positive: {y.sum()}  |  Negative: {len(y)-y.sum()}")
+
+        del sample_sums, sample_counts; gc.collect()
+
+        metrics, pipeline = _fit_cv_lr(X, y, args)
+
+        diagnostics = {
+            "X": X,
+            "y": y,
+            "sample_ids": sample_ids[:len(y)],
+            "token_counts": counts,
+            "has_prefix_dedup": False,
+        }
+        return metrics, pipeline, diagnostics
 
 
 # ==========================================
@@ -535,12 +807,12 @@ def main():
 
             elif gran == "step":
                 metrics, pipeline, diagnostics = run_step_level(
-                    raw_dir, hook_name, num_shards, d_model, args)
+                    raw_dir, hook_name, num_shards, d_model, args, index)
                 comps = compare_weights(pipeline, None, layers_dict, hook_name) if pipeline else {}
 
             elif gran == "sample":
                 metrics, pipeline, diagnostics = run_sample_level(
-                    raw_dir, hook_name, num_shards, d_model, per_sample_mask, args)
+                    raw_dir, hook_name, num_shards, d_model, per_sample_mask, args, index)
                 comps = compare_weights(pipeline, None, layers_dict, hook_name) if pipeline else {}
 
             if isinstance(metrics, dict) and "error" not in metrics:
